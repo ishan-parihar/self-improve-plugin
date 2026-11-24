@@ -391,6 +391,40 @@ class FakeGatewayTest(unittest.TestCase):
             self.diags(),
         )
 
+    def test_plugin_env_file_is_sourced(self):
+        """A hook entry in config.toml is a path, so the knobs live in a file.
+
+        Discriminating proof: the fake gateway scores every turn 0.9/0.9, so with
+        the default 0.65 skill threshold the skill branch records a lesson.
+        Writing ``SELF_IMPROVE_SKILL_THRESHOLD=0.99`` into the env file must
+        suppress that branch entirely — the one outcome only a read file can
+        produce. The genome branch is unaffected and still runs at its 0.70
+        default (its fake answer is `CURATION: nothing`, so it records nothing
+        but it does fire: the callback is what the gateway saw).
+        """
+        # baseline: no env file, skill branch fires and records
+        kinds_baseline = [e.get("kind") for e in self.ledger_after_turn()]
+        self.assertIn("skill", kinds_baseline)
+
+        # reset the ledger so the second run starts clean
+        if self.ledger.exists():
+            self.ledger.unlink()
+
+        # with the env file raising the threshold past 0.9, the branch must not fire
+        cfg_dir = self.home / ".jcode/plugins/self-improve"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        (cfg_dir / "env").write_text("SELF_IMPROVE_SKILL_THRESHOLD=0.99\n")
+        kinds = [e.get("kind") for e in self.ledger_after_turn()]
+        self.assertNotIn(
+            "skill", kinds,
+            "the env file's 0.99 threshold must suppress the skill branch",
+        )
+
+    def ledger_after_turn(self) -> list[dict]:
+        res = self.run_turn()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return self.ledger_entries()
+
     def test_parser_ignores_curation_nothing(self):
         # Point the curator at a response that yields CURATION: nothing.
         self.server.write_text(GATEWAY_PY_NOTHING)

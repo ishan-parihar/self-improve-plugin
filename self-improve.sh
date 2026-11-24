@@ -27,6 +27,18 @@ fi
 LEDGER="$HOME/.jcode/self-improve/ledger.jsonl"
 DIAGNOSTICS="$HOME/.jcode/self-improve/diagnostics.jsonl"
 STATE_DIR="$HOME/.jcode/self-improve/state"
+
+# Plugin-local settings, sourced before the defaults below. A hook cannot be given
+# environment variables from config.toml, so the knobs live in one file next to the
+# script instead: same pattern as the aroute credential file, and it keeps the
+# hook command in config.toml a single path.
+#   SELF_IMPROVE_MEMORY_URL=http://127.0.0.1:8888
+#   SELF_IMPROVE_MEMORY_BANK=omp
+for _cfg in "$HOME/.jcode/self-improve/env" "$HOME/.jcode/plugins/self-improve/env"; do
+  # shellcheck source=/dev/null
+  [[ -f "$_cfg" ]] && { set -a; . "$_cfg"; set +a; }
+done
+
 ROUTE_URL="${SELF_IMPROVE_ROUTER_URL:-https://aroute.ishanparihar.com/v1/chat/completions}"
 ROUTE_MODEL="${SELF_IMPROVE_ROUTER_MODEL:-small-stack}"
 CURATOR_MODEL="${SELF_IMPROVE_CURATOR_MODEL:-large-stack}"

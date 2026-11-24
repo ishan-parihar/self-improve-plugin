@@ -1,0 +1,12 @@
+# Plugin-local knobs for self-improve.sh (sourced by the script).
+# A hook entry in config.toml is a path, not a command with arguments, so the
+# settings live here. Same pattern as ~/.config/jcode/provider-aroute.env.
+
+# Where each recorded lesson is shared. Base URL only: the plugin appends
+# /banks/{bank}/retain, which is memory-wire's real route (a bare /retain 404s).
+SELF_IMPROVE_MEMORY_URL=http://127.0.0.1:8888
+
+# The bank lessons land in. `omp` is the shared bank this machine's other
+# harnesses (claude-code, codex, opencode, pi) already write and read, so a
+# lesson captured in jcode is recallable everywhere.
+SELF_IMPROVE_MEMORY_BANK=omp

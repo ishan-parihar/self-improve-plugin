@@ -28,9 +28,15 @@ capture that fails must never take down the turn that produced it.
 | `self-improve.sh` | the plugin; one file, sourced nowhere, run per turn |
 | `lib/test_self_improve.py` | the suite: parser, routing, dedup, housekeeping |
 | `genome.toml` | project genome (core + records + integrity) |
+| `env.example` | the plugin-local settings file, copied to `~/.jcode/plugins/self-improve/env` |
 
 State lives outside the repo at `~/.jcode/self-improve/` (ledger, diagnostics,
 status) so the plugin stays stateless and the capture survives reinstalls.
+
+A hook entry in `config.toml` is a path, not a command with arguments, so the
+knobs live in `~/.jcode/plugins/self-improve/env` — the same pattern as the
+aroute credential file. Copy `env.example` there to point the lesson share at a
+memory-wire server.
 
 ## Docs
 
