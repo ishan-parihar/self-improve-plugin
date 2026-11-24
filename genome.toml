@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# genome.toml — modules on, role → path map, module settings. Edit freely.
+[genome]
+schema_version = 2
+modules = ["core", "records", "integrity"]
+
+[paths]
+agents = "AGENTS.md"
+state = "docs/handoff/STATE.md"
+entry = "docs/handoff/README.md"
+register = "TODO.md"
+ledger = "docs/kb/CLOSED.md"
+worklog = "docs/kb/WORKLOG.md"
+asks = "docs/kb/ASKS.md"
+plans = "docs/plans"
+audits = "docs/audit"
+runbook = "docs/RUNBOOK.md"
+archive = "docs/archive"
+readme = "README.md"
+docs = "docs"
+decisions = "docs/decisions"
+regressions = "docs/regressions"
+records_index = "docs/RECORDS.md"
+
+# Suite-only gate. The plugin is a single shell script; its proof is that every
+# branch runs, the parser survives hostile input, and the files it owns stay
+# bounded. Nothing here needs a network or a provider credential, so the gate
+# runs in seconds and before every push.
+[core]
+gate = "bash -n self-improve.sh && shellcheck -S warning self-improve.sh && python3 lib/test_self_improve.py"

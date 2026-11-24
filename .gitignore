@@ -1,0 +1,5 @@
+# State lives outside the repo at ~/.jcode/self-improve/
+# Ignore only what must never be tracked.
+__pycache__/
+*.pyc
+received.jsonl
