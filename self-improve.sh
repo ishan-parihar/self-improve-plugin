@@ -567,8 +567,17 @@ main() {
     exit 0
   fi
 
+  # The router failing is an expected outcome, not an error: capture the
+  # failure explicitly. A plain `scores=$(call_router ...)` under `set -e`
+  # propagates call_router's non-zero return and aborts main() with exit 1,
+  # which jcode reports as a failed hook and which skips the `wait` below
+  # (killing any curator already backgrounded). Exit 0 always: a lesson
+  # capture that fails must never take down the turn that produced it.
   local scores
-  scores=$(call_router "$digest")
+  if ! scores=$(call_router "$digest"); then
+    exit 0
+  fi
+
   local skill_score genome_score
   skill_score=$(printf '%s' "$scores" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("skill",0))' 2>/dev/null || echo "0")
   genome_score=$(printf '%s' "$scores" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("genome",0))' 2>/dev/null || echo "0")

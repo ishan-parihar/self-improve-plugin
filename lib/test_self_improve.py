@@ -157,6 +157,31 @@ class PluginTest(unittest.TestCase):
             [d.get("reason") for d in self.diags()],
         )
 
+    def test_dead_router_exits_zero_and_logs_once(self):
+        """An unreachable router must exit 0, not abort the hook.
+
+        Regression: main() used a bare `scores=$(call_router ...)`, so under
+        `set -e` call_router's `return 1` aborted the script with exit 1.
+        A lesson capture that fails must never take down the turn that
+        produced it, and the `wait` below must still run so any curator that
+        did get backgrounded is not orphaned.
+        """
+        res = run_plugin(
+            {
+                "JCODE_HOOK_STATUS": "ok",
+                "JCODE_HOOK_LAST_ASSISTANT_TEXT": "a real procedure worth scoring",
+                "JCODE_HOOK_SESSION_ID": "dead-router",
+                "AROUTE_API_KEY": "dummy",
+                "SELF_IMPROVE_ROUTER_URL": "http://127.0.0.1:1/v1/chat/completions",
+                "SELF_IMPROVE_ROUTER_MAX_TOKENS": "8",
+            },
+            home=self.home,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        failed = [d for d in self.diags() if d.get("kind") == "router-failed"]
+        self.assertEqual(len(failed), 1, self.diags())
+        self.assertEqual(self.ledger_entries(), [])
+
     def test_housekeeping_caps_ledger(self):
         # Seed a ledger larger than the cap; housekeeping trims to the last N.
         cap = 500
