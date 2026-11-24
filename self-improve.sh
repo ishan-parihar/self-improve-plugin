@@ -516,27 +516,37 @@ print(json.dumps(entry))
   cue_short=$(printf '%s' "$cue" | head -c 80 | tr '\n' ' ')
   log_diag "curation-recorded" "\"branch\":\"$kind\",\"cue\":\"$cue_short\""
 
-  # Share the lesson with memory-wire if it's running (best-effort, never fails).
-  # Opt-in via SELF_IMPROVE_MEMORY_URL (e.g. http://127.0.0.1:18913/retain).
-  # Default unset = no call, no failure mode. The earlier hardcoded :8888 target
-  # was a dead port (memory-wire listens on 18913/18914), so a default-off call is
-  # both honest about the dependency and testable without one.
-  if [[ -n "${SELF_IMPROVE_MEMORY_URL:-}" ]]; then
+  # Share the lesson with memory-wire, verbatim from the plugin's own memory contract.
+  #
+  # The route is /banks/{bank}/retain, not /retain — verified against the live server
+  # (memory-wire mcp / serve both serve MemoryService; memory-wire's own hermes integration
+  # posts the same shape at "{base}/banks/{bank}/retain"). A bare /retain 404s.
+  #
+  # Default off: no URL means no call, no dependency, and the suite runs without one.
+  # Set SELF_IMPROVE_MEMORY_URL to the BASE (e.g. http://127.0.0.1:8888) and the
+  # bank is appended here, matching how the hermes integration resolves them
+  # (MEMORY_WIRE_URL + MEMORY_WIRE_BANK, then the saved config, then the defaults).
+  local mem_base="$SELF_IMPROVE_MEMORY_URL"
+  local mem_bank="${SELF_IMPROVE_MEMORY_BANK:-memory-wire}"
+
+  # Do not fail on an unreachable server: a memory share that fails must never
+  # take down the turn that produced it, and must never block on one either.
+  if [[ -n "$mem_base" ]]; then
     local payload
     payload=$(python3 -c "
 import json, sys
 print(json.dumps({
-    'bank': 'self-improve',
     'content': f'[{sys.argv[1]}] {sys.argv[2]}',
     'context': sys.argv[3],
+    'tags': ['hook:sync-turn'],
 }))
 " "$kind" "$lesson" "$evidence" 2>/dev/null) || payload=''
     if [[ -n "$payload" ]]; then
       curl -sS --connect-timeout 1 --max-time 3 \
-          -X POST "$SELF_IMPROVE_MEMORY_URL" \
+          -X POST "${mem_base}/banks/${mem_bank}/retain" \
           -H "Content-Type: application/json" \
           -d "$payload" \
-          >/dev/null 2>&1 || true  # memory-wire down, skip silently
+          >/dev/null 2>&1 || log_diag "memory-failed" "\"branch\":\"$kind\",\"reason\":\"unreachable\""
     fi
   fi
 }

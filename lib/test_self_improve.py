@@ -278,21 +278,21 @@ class FakeGatewayTest(unittest.TestCase):
     def ledger_entries(self) -> list[dict]:
         return read_jsonl(self.ledger)
 
-    def run_turn(self, assistant_text: str = "Fixed the flaky test by waiting on a condition variable.") -> subprocess.CompletedProcess:
-        return run_plugin(
-            {
-                "JCODE_HOOK_STATUS": "ok",
-                "JCODE_HOOK_LAST_ASSISTANT_TEXT": assistant_text,
-                "JCODE_HOOK_SESSION_ID": "fake-session",
-                "AROUTE_API_KEY": "dummy",
-                "SELF_IMPROVE_ROUTER_URL": f"http://127.0.0.1:{self.port}/v1/chat/completions",
-                "SELF_IMPROVE_ROUTER_MODEL": "small-stack",
-                "SELF_IMPROVE_CURATOR_MODEL": "large-stack",
-                "SELF_IMPROVE_SKILL_THRESHOLD": "0.5",
-                "SELF_IMPROVE_GENOME_THRESHOLD": "0.5",
-            },
-            home=self.home,
-        )
+    def run_turn(self, assistant_text: str = "Fixed the flaky test by waiting on a condition variable.", mem_url: str | None = None) -> subprocess.CompletedProcess:
+        env = {
+            "JCODE_HOOK_STATUS": "ok",
+            "JCODE_HOOK_LAST_ASSISTANT_TEXT": assistant_text,
+            "JCODE_HOOK_SESSION_ID": "fake-session",
+            "AROUTE_API_KEY": "dummy",
+            "SELF_IMPROVE_ROUTER_URL": f"http://127.0.0.1:{self.port}/v1/chat/completions",
+            "SELF_IMPROVE_ROUTER_MODEL": "small-stack",
+            "SELF_IMPROVE_CURATOR_MODEL": "large-stack",
+            "SELF_IMPROVE_SKILL_THRESHOLD": "0.5",
+            "SELF_IMPROVE_GENOME_THRESHOLD": "0.5",
+        }
+        if mem_url is not None:
+            env["SELF_IMPROVE_MEMORY_URL"] = mem_url
+        return run_plugin(env, home=self.home)
 
     def test_full_turn_records_a_skill_lesson(self):
         res = self.run_turn()
@@ -316,6 +316,53 @@ class FakeGatewayTest(unittest.TestCase):
         # and the dedup was logged
         self.assertTrue(
             any(d.get("kind") == "curation-duplicate" for d in self.diags()),
+            self.diags(),
+        )
+
+    def test_memory_share_posts_to_bank_route(self):
+        """The lesson share must hit /banks/{bank}/retain (not /retain).
+
+        The fake gateway records the request path on a sibling file, so the
+        test asserts the exact route rather than trusting a substring.
+        """
+        import socket
+
+        paths_file = self.home / "paths.log"
+        path_server = self.home / "pathserver.py"
+        path_server.write_text(PATH_SERVER_PY)
+        proc = subprocess.Popen(
+            [sys.executable, str(path_server)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(100):
+                try:
+                    s = socket.create_connection(("127.0.0.1", 18978), timeout=0.1)
+                    s.close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                self.fail("path server did not start")
+            res = self.run_turn(mem_url="http://127.0.0.1:18978")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(
+            len([e for e in self.ledger_entries() if e.get("kind") == "skill"]), 1
+        )
+        self.assertTrue(paths_file.exists(), "no retain request was recorded")
+        self.assertIn("POST /banks/memory-wire/retain", paths_file.read_text())
+
+    def test_memory_share_to_dead_server_logs_and_does_not_fail(self):
+        # A refused connection must be logged, not raised, and the lesson stays.
+        res = self.run_turn(mem_url="http://127.0.0.1:1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len([e for e in self.ledger_entries() if e.get("kind") == "skill"]), 1)
+        self.assertTrue(
+            any(d.get("kind") == "memory-failed" for d in self.diags()),
             self.diags(),
         )
 
@@ -415,6 +462,33 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(out)
 socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer(("127.0.0.1", 18977), H) as httpd:
+    httpd.serve_forever()
+'''
+
+
+PATH_SERVER_PY = r'''
+import http.server, socketserver
+from pathlib import Path
+
+LOGPATH = Path(__file__).with_name("paths.log")
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        if n:
+            self.rfile.read(n)
+        with LOGPATH.open("a") as f:
+            f.write(f"{self.command} {self.path}\n")
+        out = b'{"id":"stub"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", 18978), H) as httpd:
     httpd.serve_forever()
 '''
 

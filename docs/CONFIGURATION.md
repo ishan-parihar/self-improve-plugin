@@ -3,6 +3,28 @@
 Every knob is an env var read by `self-improve.sh`. Defaults are the current
 behaviour; an unset variable means the default.
 
+## memory-wire sharing
+
+The plugin can share each recorded lesson into a [memory-wire](https://github.com/ishan-parihar/memory-wire)
+bank. It is off by default and independent of jcode's memory-wire MCP server, so the
+suite and any machine without the server run without it.
+
+```bash
+SELF_IMPROVE_MEMORY_URL=http://127.0.0.1:8888
+SELF_IMPROVE_MEMORY_BANK=memory-wire
+```
+
+The route is `POST {url}/banks/{bank}/retain` — the shape memory-wire's own hermes
+integration posts. A bare `/retain` 404s. A refused connection is logged as a
+`memory-failed` diagnostic and the turn keeps its lesson: the share is an extra, never
+a dependency.
+
+jcode's first-class memory-wire tools (`memory_retain`, `memory_recall`,
+`memory_reflect`, `memory_bank_config_get`) already come from its MCP entry in
+`~/.jcode/mcp.json`; those are the recall/reflect surface an agent uses during a
+turn, and this hook is the write surface it uses after one.
+
+
 ## Identity and gating
 
 | var | default | what it does |
@@ -40,7 +62,8 @@ behaviour; an unset variable means the default.
 
 | var | default | what it does |
 |---|---|---|
-| `SELF_IMPROVE_MEMORY_URL` | unset | if set, POST each lesson to this URL as JSON; unset = no call, no failure mode |
+| `SELF_IMPROVE_MEMORY_URL` | unset | base URL of a memory-wire server; if unset, no memory call is made at all |
+| `SELF_IMPROVE_MEMORY_BANK` | `memory-wire` | bank each recorded lesson is shared into |
 
 ## State files (created under `$HOME/.jcode/self-improve/`)
 
