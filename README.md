@@ -36,7 +36,8 @@ status) so the plugin stays stateless and the capture survives reinstalls.
 A hook entry in `config.toml` is a path, not a command with arguments, so the
 knobs live in `~/.jcode/plugins/self-improve/env` — the same pattern as the
 aroute credential file. Copy `env.example` there to point the lesson share at a
-memory-wire server.
+memory-wire server. Only `env.example` is tracked; `env` is machine-local and
+gitignored, so a fresh clone ships no host-specific bank or port.
 
 ## Docs
 

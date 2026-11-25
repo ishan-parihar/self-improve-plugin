@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 received.jsonl
+
+# Machine-local copy of env.example; never tracked (see README).
+env
