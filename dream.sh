@@ -38,62 +38,9 @@ source "$SELF_IMPROVE_DIR/lib/common.sh"
 # unapplied. Handled before anything else so it cannot claim the day or write.
 if [ "${1:-}" = "--report" ]; then
   self_improve_load_env
-  LEDGER="$SELF_IMPROVE_LEDGER" python3 - <<'PY'
-import json, os, sys
-
-path = os.environ["LEDGER"]
-try:
-    fh = open(path, encoding="utf-8")
-except FileNotFoundError:
-    print("no ledger yet at %s" % path)
-    raise SystemExit(0)
-
-banks = {}
-total = applied = 0
-for line in fh:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        e = json.loads(line)
-    except ValueError:
-        continue          # a truncated or foreign row is not a dream record
-    if e.get("kind") != "dream":
-        continue
-    total += 1
-    if e.get("applied"):
-        applied += 1
-    b = banks.setdefault(e.get("bank") or "?", {
-        "passes": 0, "candidates": 0, "by_kind": {}, "last": None,
-    })
-    b["passes"] += 1
-    b["last"] = e.get("ts")
-    detail = e.get("detail") or ""
-    try:
-        d = json.loads(detail)
-    except ValueError:
-        d = {}
-    b["candidates"] += d.get("total") or 0
-    for k, v in (d.get("by_kind") or {}).items():
-        b["by_kind"][k] = b["by_kind"].get(k, 0) + v
-
-if not total:
-    print("no dream records in %s" % path)
-    raise SystemExit(0)
-
-print("dream report  (%s)" % path)
-print("  passes: %d   applied: %d   awaiting a decision: %d"
-      % (total, applied, total - applied))
-for bank in sorted(banks):
-    b = banks[bank]
-    kinds = ", ".join("%s %d" % (k, b["by_kind"][k])
-                       for k in sorted(b["by_kind"])) or "none"
-    print("  %-40s passes=%-3d candidates=%-6d last=%s"
-          % (bank, b["passes"], b["candidates"], b["last"]))
-    print("      %s" % kinds)
-print("\nNothing was applied. Candidates are a report, not an action: a wrong")
-print("merge silently corrupts recall and there is no undo.")
-PY
+  # The reader lives in lib/report.py: 100 lines of ledger parsing have no business
+  # inside a hook, and keeping them here made the stage's one job hard to read.
+  LEDGER="$SELF_IMPROVE_LEDGER" python3 "$SELF_IMPROVE_DIR/lib/report.py"
   exit 0
 fi
 
@@ -165,14 +112,33 @@ print(json.dumps(entry))
 # same instant cannot both see an empty stamp: the loser finds today's date and
 # skips. A lock held across the pass itself would serialise every session's exit for
 # nothing, so the lock is taken only for the check-and-claim.
+#
+# The claim is abandoned, not absolute: the stamp is written before the pass, so a
+# session killed mid-pass (OOM, power loss, `kill -9`) leaves a stamp for a pass that
+# never finished, and every later session today would skip a day that was never
+# spent. A stamp older than the hygiene timebox plus a margin is treated as
+# abandoned and re-claimed. The margin covers a slow but live pass, so only a
+# genuinely dead claim is taken over.
 stamp="$dream_dir/${bank//\//_}.last"
 today=$(date -u +%Y-%m-%d)
+# 120s timebox + 60s margin. A pass still running is not abandoned.
+claim_max_age=${SELF_IMPROVE_DREAM_CLAIM_TTL_SECS:-180}
 mkdir -p "$dream_dir" 2>/dev/null
 claim_state="none"
 {
   flock 8
   if [ "$(cat "$stamp" 2>/dev/null)" = "$today" ]; then
-    claim_state="held"
+    # Today's claim. Keep it only if it is young enough to still be a live pass.
+    # Age is read from the mtime rather than compared with `find -mmin`: integer
+    # seconds-per-minute turns any TTL under 60s into a zero-minute window that
+    # matches nothing, so every stamp reads as abandoned.
+    age=$(( $(date +%s) - $(stat -c %Y "$stamp" 2>/dev/null || date +%s) ))
+    if [ "$age" -lt "$claim_max_age" ]; then
+      claim_state="held"
+    else
+      log "dream $hook_id: bank=$bank claim is ${age}s old (>${claim_max_age}s), reclaiming"
+      printf '%s\n' "$today" >"$stamp" 2>/dev/null && claim_state="claimed"
+    fi
   else
     printf '%s\n' "$today" >"$stamp" 2>/dev/null && claim_state="claimed"
   fi
@@ -195,7 +161,9 @@ if [ "$claim_state" != "claimed" ]; then
 fi
 
 # From here this session owns the day. Every exit path below either completes the
-# pass or drops the claim, so a failure never burns the day's only attempt.
+# pass or drops the claim. A path that cannot run (SIGKILL, power loss) drops
+# nothing, which is why the claim carries an age: an abandoned stamp is reclaimed
+# rather than trusted.
 release_claim() {
   {
     flock 8

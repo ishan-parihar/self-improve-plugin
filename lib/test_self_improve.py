@@ -27,6 +27,7 @@ cannot collide on a fixed port and report a hang or a false pass.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import socket
@@ -1112,6 +1113,11 @@ class DreamTest(unittest.TestCase):
     def _dreams(self) -> list[dict]:
         return [e for e in read_jsonl(self.ledger) if e.get("kind") == "dream"]
 
+    @staticmethod
+    def _today() -> str:
+        """UTC date as the stamp writes it, so a test can forge a stamp."""
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
     def test_candidates_are_recorded_and_never_applied(self):
         proc, port = self._serve({
             "b1": {
@@ -1352,6 +1358,102 @@ class DreamTest(unittest.TestCase):
         self.assertIn("awaiting a decision: 1", out)
         self.assertIn("merge 1", out)
         self.assertIn("supersede 1", out)
+
+    def test_an_abandoned_claim_is_reclaimed(self):
+        """A session killed mid-pass must not burn the day.
+
+        The claim is written before the pass, so a SIGKILL (OOM, power loss) leaves
+        a stamp for a pass that never finished. Without an age check every later
+        session today reads "already consolidated" and skips a day that was never
+        spent. The stamp is old here, so it must be taken over.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        # A stamp from an earlier pass that was killed: today's date, old mtime.
+        stamp = self.state_dir / "b1.last"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(self._today())
+        old = time.time() - 4000
+        os.utime(stamp, (old, old))
+        try:
+            res = run_dream(
+                {"JCODE_HOOK_ID": "reclaim", "JCODE_HOOK_CWD": str(self.home),
+                 "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
+                 "SELF_IMPROVE_MEMORY_BANK": "b1",
+                 "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                 "SELF_IMPROVE_LEDGER": str(self.ledger),
+                 "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+                 # A 1s TTL makes the mechanism observable without waiting minutes.
+                 "SELF_IMPROVE_DREAM_CLAIM_TTL_SECS": "1"},
+                home=self.home,
+            )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # The abandoned claim was taken over and the pass ran: not "skipped".
+        self.assertEqual(
+            [d["outcome"] for d in self._dreams()], ["clean"], self._dreams(),
+        )
+        # The fresh claim is in place, so a later session still skips.
+        self.assertEqual(stamp.read_text().strip(), self._today())
+
+    def test_a_live_claim_is_not_stolen(self):
+        """A young stamp is a pass in flight, so it must be respected.
+
+        Reclaiming on age alone would let a second session start a second pass while
+        the first is still running, which is the duplicate the claim exists to stop.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        stamp = self.state_dir / "b1.last"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(self._today())   # fresh mtime = a live pass
+        try:
+            res = run_dream(
+                {"JCODE_HOOK_ID": "live", "JCODE_HOOK_CWD": str(self.home),
+                 "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
+                 "SELF_IMPROVE_MEMORY_BANK": "b1",
+                 "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                 "SELF_IMPROVE_LEDGER": str(self.ledger),
+                 "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+                 "SELF_IMPROVE_DREAM_CLAIM_TTL_SECS": "1"},
+                home=self.home,
+            )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(
+            [d["outcome"] for d in self._dreams()], ["skipped"], self._dreams(),
+        )
+
+    def test_both_stages_take_the_same_ledger_lock(self):
+        """One ledger needs one lock.
+
+        The turn stage locked `state/ledger.lock` while the dream stage locked
+        `ledger.lock`, so neither excluded the other. The appends are small enough
+        to be atomic today, which is why nothing corrupted, but a lock that reads as
+        a guarantee and is not one is worse than no lock.
+        """
+        turn = (ROOT / "self-improve.sh").read_text()
+        common = (ROOT / "lib/common.sh").read_text()
+        self.assertIn('9>"$SELF_IMPROVE_STATE_ROOT/ledger.lock"', turn,
+                      "the turn stage must take the shared lock")
+        self.assertIn('9>"$SELF_IMPROVE_STATE_ROOT/ledger.lock"', common,
+                      "the shared writer must take the same lock")
+        # The old split path must be gone from both, or a reader cannot tell which
+        # one is live.
+        self.assertNotIn('STATE_DIR/ledger.lock', turn)
+        self.assertNotIn('STATE_DIR/ledger.lock', common)
 
     def test_env_file_supplies_the_memory_url(self):
         """dream.sh reads the SAME env file the turn loop reads.

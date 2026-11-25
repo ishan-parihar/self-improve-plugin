@@ -57,19 +57,23 @@ turn, and this hook is the write surface it uses after one.
 | `SELF_IMPROVE_MAX_PROFILE_PER_HOUR` | `24` | profile-wide spawns per rolling hour |
 | `SELF_IMPROVE_MAX_LEDGER_ENTRIES` | `500` | ledger is capped to the last N entries |
 | `SELF_IMPROVE_STATE_TTL_SECS` | `86400` | per-session spawn files older than this are pruned |
+| `SELF_IMPROVE_DREAM_CLAIM_TTL_SECS` | `180` | a dream stamp older than this is treated as abandoned and re-claimed (the hygiene timebox is 120s, plus a margin) |
 
 ## Optional integration
 
 | var | default | what it does |
 |---|---|---|
 | `SELF_IMPROVE_MEMORY_URL` | unset | base URL of a memory-wire server; if unset, no memory call is made at all |
-| `SELF_IMPROVE_MEMORY_BANK` | `memory-wire` | bank each recorded lesson is shared into |
+| `SELF_IMPROVE_MEMORY_BANK` | derived | bank each recorded lesson is shared into. Derived, not a constant: `owner/repo` from the origin remote, else the work-tree directory name, else `memory-wire`. Set it only to force a specific bank. |
 
 ## State files (created under `$HOME/.jcode/self-improve/`)
 
 | path | role |
 |---|---|
-| `ledger.jsonl` | append-only lessons, capped at `MAX_LEDGER_ENTRIES` |
-| `diagnostics.jsonl` | one JSON line per decision: `skip`, `router`, `cap`, `curation-*` |
+| `ledger.jsonl` | append-only lessons and dream records, capped at `MAX_LEDGER_ENTRIES` |
+| `diagnostics.jsonl` | one JSON line per decision: `skip`, `router`, `cap`, `curation-*`, `dream-*` |
 | `state/spawns-<session>` | rolling-hour timestamps for the per-session limiter |
 | `state/spawns-profile` | rolling-hour timestamps for the profile limiter |
+| `dream/<bank>.last` | the day-claim for one bank: today's date while a pass owns the day |
+| `dream/<bank>.lock` | the per-bank lock that makes the claim atomic |
+| `dream/<bank>.hygiene.json` | the last hygiene response, kept for inspection |

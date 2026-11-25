@@ -49,6 +49,7 @@ outcomes.
 | `self-improve.sh` | the turn stage; run per turn on `turn_end` |
 | `dream.sh` | the dream stage; run per session on `session_end` |
 | `lib/common.sh` | shared paths, env loading, JSON writer, ledger cap, bank ladder |
+| `lib/report.py` | the `--report` reader: dream records grouped by bank |
 | `lib/test_self_improve.py` | the suite: parser, routing, dedup, housekeeping, concurrency |
 | `genome.toml` | project genome (core + records + integrity) |
 | `env.example` | the plugin-local settings file, copied to `~/.jcode/plugins/self-improve/env` |

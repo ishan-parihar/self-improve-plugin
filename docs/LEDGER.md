@@ -26,10 +26,39 @@ capped to the last `SELF_IMPROVE_MAX_LEDGER_ENTRIES` (default 500).
 | `evidence` | what in the turn supported it |
 | `confidence` | `high` / `medium` / `low`; the last field, defaults `medium` |
 | `verdict` | always `not observed` on write; a later observer may promote it |
-| `kind` | `skill` or `genome` |
+| `kind` | `skill`, `genome`, or `dream` (see below) |
 | `origin` | `direct` (a curator wrote it); dsh's other origins are unused here yet |
 | `createdAt` | UTC RFC 3339 with milliseconds |
 | `sourceTurn` | `JCODE_HOOK_SESSION_ID`, so a lesson traces back to its turn |
+
+## Dream records
+
+The dream stage (`dream.sh`, `session_end`) appends a different shape to the same
+file. It has no `cue` or `lesson`: it reports what a consolidation pass found.
+
+```json
+{
+  "ts": "2026-11-25T13:16:34.428Z",
+  "kind": "dream",
+  "hook_id": "session-id-or-manual-<pid>",
+  "bank": "owner-repo",
+  "outcome": "candidates",
+  "detail": "{\"total\": 73, \"by_kind\": {\"anchor\": 22, \"merge\": 35}, \"rows_scanned\": 677}",
+  "applied": false,
+  "rows": 677
+}
+```
+
+| field | meaning |
+|---|---|
+| `bank` | the memory-wire bank the pass ran over |
+| `outcome` | `candidates` (found some), `clean` (none), `skipped` (already ran today), `empty` (bank has no rows), `disabled` (no memory URL), or `error` |
+| `detail` | JSON text: `total`, `by_kind`, `rows_scanned` |
+| `applied` | always `false`. Candidates are a report, not an action: a wrong merge corrupts recall with no undo |
+| `rows` | rows the pass scanned |
+
+Read them back with `dream.sh --report`, which groups by bank and counts what is
+still awaiting a decision. It is read-only: no pass, no write, no claim.
 
 ## How the fields are derived
 

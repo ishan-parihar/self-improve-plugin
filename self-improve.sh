@@ -598,7 +598,7 @@ entry = {
 }
 print(json.dumps(entry))
 " "$cue" "$lesson" "$evidence" "$confidence" "$kind" "$ts" "$turn_ref" >> "$LEDGER"
-  } 9>"$STATE_DIR/ledger.lock"
+  } 9>"$SELF_IMPROVE_STATE_ROOT/ledger.lock"
 
   local cue_short
   cue_short=$(printf '%s' "$cue" | head -c 80 | tr '\n' ' ')
