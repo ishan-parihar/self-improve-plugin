@@ -11,18 +11,25 @@ credential, or a live gateway:
   * the parser survives hostile curator output (reasoning leakage, missing
     fields, template placeholders, fewer-than-three parts, all the confidence
     spellings);
-  * dedup suppresses an exact-cue replay;
-  * housekeeping prunes stale spawn files and caps the ledger;
+  * dedup suppresses an exact-cue replay, including a cue carrying a quote or
+    a backslash, and including two curators racing the same turn;
+  * housekeeping prunes stale spawn files and caps both JSONL files;
+  * every diagnostic arm is asserted by at least one case, so a silent
+    regression in a "nothing happened" path fails a test;
   * a full fake-gateway run records a lesson and a second identical run does
     not (the dedup contract end to end).
 
 Run:  python3 lib/test_self_improve.py [case]
 Exit 0 on success, 1 on first failure.
+
+Ports are requested from the OS (bind 0, read back), so two runs of this suite
+cannot collide on a fixed port and report a hang or a false pass.
 """
 from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -61,6 +68,20 @@ def run_plugin(
         text=True,
         timeout=30,
     )
+
+
+def free_port() -> int:
+    """Ask the OS for an unused TCP port.
+
+    A fixed port makes two concurrent runs of this suite collide, and the failure
+    mode is a hang or a false pass rather than an error. Binding 0 and reading the
+    assigned port back removes the collision class entirely.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -257,37 +278,69 @@ class FakeGatewayTest(unittest.TestCase):
     plugin touches is HTTP POST to ROUTE_URL, so a loopback stub exercises the
     router, curator, parser, dedup and ledger write paths for real."""
 
+    def _spawn_gateway(self) -> None:
+        """Start the fake gateway on a FRESH port, keeping stderr.
+
+        A fresh port matters: reusing one after terminate lets the dying socket
+        answer the readiness probe while the new bind is still pending, so the
+        plugin's curl then fails. stderr is captured to a file so a startup
+        failure reports its cause instead of timing out as "did not start".
+        """
+        self.port = free_port()
+        self.server_err.seek(0)
+        self.server_err.truncate()
+        self.proc = subprocess.Popen(
+            [sys.executable, str(self.server), str(self.port)],
+            stdout=subprocess.DEVNULL,
+            stderr=self.server_err,
+        )
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
         self.ledger = self.home / ".jcode/self-improve/ledger.jsonl"
         self.diag = self.home / ".jcode/self-improve/diagnostics.jsonl"
-        # Stateful script: first call answers the router, second answers the
-        # curator. It records each body it received so tests can assert what
-        # the plugin sent.
+        # The gateway answers the router with a fixed score and the curator with
+        # whatever is in self.answer_path, so a case can drive the parser with
+        # hostile text without rewriting and restarting the server. It records
+        # every body so tests can assert what the plugin actually sent.
         self.server = self.home / "gateway.py"
         self.server.write_text(GATEWAY_PY)
-        self.received = self.home / "received.jsonl"
-        self.proc = subprocess.Popen(
-            [sys.executable, str(self.server)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # wait for the port to come up
-        port = 18977
-        for _ in range(100):
-            try:
-                import socket
+        # The gateway writes received.jsonl next to itself, so the test reads the
+        # same path. Reading a path under HOME while the server wrote next to the
+        # script silently saw nothing and failed the wire assertions.
+        self.received = self.server.parent / "received.jsonl"
+        self.answer_path = self.home / "answer.txt"
+        self.answer_path.write_text(self._default_answer)
+        self.server_err = open(self.home / "gateway.err", "w+")
+        self.addCleanup(self.server_err.close)
+        self._spawn_gateway()
+        self._wait_for_port()
 
-                s = socket.create_connection(("127.0.0.1", port), timeout=0.1)
+    _default_answer = (
+        "CURATION: debugging a flaky test | Wait on a condition variable, never "
+        "sleep-and-poll, because sleep is racy | the test failed intermittently "
+        "and passed with a cv wait | high"
+    )
+
+    def _wait_for_port(self) -> None:
+        for _ in range(100):
+            if self.proc.poll() is not None:
+                # The server died on startup. Surface why: with stderr on
+                # DEVNULL the only symptom was "did not start".
+                self.server_err.seek(0)
+                err = self.server_err.read()
+                raise RuntimeError(
+                    f"fake gateway exited {self.proc.returncode}: {err[-800:]}"
+                )
+            try:
+                s = socket.create_connection(("127.0.0.1", self.port), timeout=0.1)
                 s.close()
-                break
+                return
             except OSError:
                 time.sleep(0.05)
-        else:
-            self.proc.kill()
-            raise RuntimeError("fake gateway did not start")
-        self.port = port
+        self.proc.kill()
+        raise RuntimeError("fake gateway did not start")
 
     def tearDown(self) -> None:
         self.proc.terminate()
@@ -303,7 +356,18 @@ class FakeGatewayTest(unittest.TestCase):
     def ledger_entries(self) -> list[dict]:
         return read_jsonl(self.ledger)
 
-    def run_turn(self, assistant_text: str = "Fixed the flaky test by waiting on a condition variable.", mem_url: str | None = None) -> subprocess.CompletedProcess:
+    def run_turn(self, assistant_text: str = "Fixed the flaky test by waiting on a condition variable.", mem_url: str | None = None, curator_answer: str = "CURATION: debugging a flaky test | Wait on a condition variable, never sleep-and-poll, because sleep is racy | the test failed intermittently and passed with a cv wait | high") -> subprocess.CompletedProcess:
+        """Run one turn end to end.
+
+        ``curator_answer`` is what the gateway's curator reply carries. It lets a
+        case drive the parser with hostile text without rewriting the gateway
+        script and restarting the server.
+        """
+        if curator_answer != self._default_answer:
+            # The gateway reads the answer file per request, so swapping the text
+            # is enough. Restarting the server here used to reuse the old port,
+            # which races TIME_WAIT and can fail the turn's curl.
+            self.answer_path.write_text(curator_answer)
         env = {
             "JCODE_HOOK_STATUS": "ok",
             "JCODE_HOOK_LAST_ASSISTANT_TEXT": assistant_text,
@@ -355,22 +419,23 @@ class FakeGatewayTest(unittest.TestCase):
         paths_file = self.home / "paths.log"
         path_server = self.home / "pathserver.py"
         path_server.write_text(PATH_SERVER_PY)
+        mem_port = free_port()
         proc = subprocess.Popen(
-            [sys.executable, str(path_server)],
+            [sys.executable, str(path_server), str(mem_port)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         try:
             for _ in range(100):
                 try:
-                    s = socket.create_connection(("127.0.0.1", 18978), timeout=0.1)
+                    s = socket.create_connection(("127.0.0.1", mem_port), timeout=0.1)
                     s.close()
                     break
                 except OSError:
                     time.sleep(0.05)
             else:
                 self.fail("path server did not start")
-            res = self.run_turn(mem_url="http://127.0.0.1:18978")
+            res = self.run_turn(mem_url=f"http://127.0.0.1:{mem_port}")
         finally:
             proc.terminate()
             proc.wait(timeout=3)
@@ -425,25 +490,177 @@ class FakeGatewayTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         return self.ledger_entries()
 
+    def test_quote_and_backslash_cue_round_trips(self):
+        """A cue carrying a quote or a backslash must record once and dedup.
+
+        The diagnostics writer used printf, so either character produced an
+        unparseable line, and the dedup check grepped the literal \"cue\": \"...\"
+        text, so the same cue was written again. This drives the real plugin with
+        such a cue twice and asserts one row plus parseable diagnostics.
+        """
+        nasty = 'use "volatile" and \\ backslash here'
+        self.run_turn(curator_answer=f"CURATION: {nasty} | lesson | evidence")
+        first = self.ledger_entries()
+        # The turn fires both branches and the gateway answers them the same way, so
+        # a turn may record one row per kind. The contract under test is per (cue,
+        # kind): exactly one row of each, never two of either.
+        kinds = [e["kind"] for e in first]
+        self.assertEqual(sorted(kinds), ["genome", "skill"], first)
+        for e in first:
+            self.assertEqual(e["cue"], nasty)
+        # every diagnostics line must parse, including the recorded one
+        for line in self.diag.read_text().splitlines():
+            json.loads(line)
+        # a second identical turn must not add a row
+        self.run_turn(curator_answer=f"CURATION: {nasty} | lesson | evidence")
+        self.assertEqual(len(self.ledger_entries()), 2)
+        self.assertTrue(
+            any(d.get("kind") == "curation-duplicate" for d in self.diags()),
+            self.diags(),
+        )
+
+    def test_concurrent_curators_write_one_row(self):
+        """A cue racing itself across turns must yield one row per kind.
+
+        Measured on the real plugin before the fix: one turn wrote two rows of
+        the SAME kind, because both curators passed the dedup check before
+        either appended. The check and the append now share an flock, so two
+        concurrent turns of one kind collapse to one row each.
+        """
+        import concurrent.futures as cf
+
+        with cf.ThreadPoolExecutor(2) as ex:
+            list(ex.map(lambda _: self.run_turn(), range(2)))
+        rows = self.ledger_entries()
+        kinds = [r["kind"] for r in rows]
+        self.assertEqual(sorted(kinds), ["genome", "skill"], rows)
+
+    def test_diagnostics_is_capped(self):
+        """diagnostics.jsonl is capped like the ledger, not unbounded."""
+        cap = 5
+        d = self.home / ".jcode/self-improve"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "diagnostics.jsonl").write_text(
+            "".join(json.dumps({"i": i}) + "\n" for i in range(cap + 10))
+        )
+        res = run_plugin(
+            {
+                "JCODE_HOOK_STATUS": "ok",
+                "JCODE_HOOK_LAST_ASSISTANT_TEXT": "",
+                "AROUTE_API_KEY": "dummy",
+                "SELF_IMPROVE_MAX_LEDGER_ENTRIES": str(cap),
+            },
+            home=self.home,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.diags()), cap)
+
+    def test_model_on_the_wire(self):
+        """The router body must name small-stack and the curator large-stack.
+
+        The suite set these env vars but asserted nothing, so a regression that
+        swapped the two models passed. The fake gateway records every body.
+        """
+        self.run_turn()
+        bodies = [json.loads(l) for l in self.received.read_text().splitlines()]
+        models = [b.get("model") for b in bodies]
+        self.assertIn("small-stack", models, models)
+        self.assertIn("large-stack", models, models)
+        # and the router is the small one, the curator the large one
+        for b in bodies:
+            head = b["messages"][0]["content"]
+            if "evaluating whether a completed agent turn" in head:
+                self.assertEqual(b["model"], "small-stack")
+            else:
+                self.assertEqual(b["model"], "large-stack")
+
+    def restart_gateway(self) -> None:
+        """Stop and restart the fake gateway from its current script.
+
+        The port must be fresh: reusing one after terminate lets the dying socket
+        answer the readiness probe while the new bind is still pending, so the
+        plugin's curl fails and logs router-failed.
+        """
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=3)
+        self._spawn_gateway()
+        self._wait_for_port()
+
+    # -- diagnostic arm coverage ------------------------------------------
+    #
+    # Every arm log_diag can emit must have a case that fails if the arm stops
+    # firing. The arms below cover the "nothing happened" paths plus the one arm
+    # that means the product worked, so a silent regression in any of them shows
+    # up as a red test rather than a quiet ledger.
+
+    def assert_arm(self, arm: str) -> None:
+        self.assertTrue(
+            any(d.get("kind") == arm for d in self.diags()),
+            f"arm {arm!r} never fired: {self.diags()}",
+        )
+
+    def test_arm_curation_recorded(self):
+        """The success arm: one turn, both branches, a recorded row each."""
+        self.run_turn()
+        self.assert_arm("curation-recorded")
+
+    def test_arm_router(self):
+        """The router arm reports the scores it got, whatever they are."""
+        self.run_turn()
+        self.assert_arm("router")
+
+    def test_arm_curation_incomplete(self):
+        """Three fields with an empty one is incomplete, not parse-failed.
+
+        The count guard must not swallow this: a line with the right number of
+        parts but a blank field is the incomplete case, and it used to be
+        unreachable because the count check ran before the blank could be seen.
+        """
+        self.run_turn(curator_answer="CURATION: a cue | | evidence")
+        self.assert_arm("curation-incomplete")
+        self.assertEqual(self.ledger_entries(), [])
+
+    def test_arm_curation_parse_failed(self):
+        """Fewer than three parts logs parse-failed and records nothing."""
+        self.run_turn(curator_answer="CURATION: only one part")
+        self.assert_arm("curation-parse-failed")
+
+    def test_arm_curation_template(self):
+        """A cue still carrying <angle brackets> is a template, not a lesson."""
+        self.run_turn(curator_answer="CURATION: <cue> | <lesson> | <evidence>")
+        self.assert_arm("curation-template")
+
+    def test_arm_no_curation(self):
+        """A reply with no CURATION line at all logs no-curation."""
+        self.run_turn(curator_answer="I found nothing worth writing down.")
+        self.assert_arm("no-curation")
+
+    def test_arm_curator_failed(self):
+        """The router succeeds but the curator call fails: curator-failed."""
+        # Same fake gateway, but the plugin's curator URL points at a dead port
+        # while the router URL stays live. The knobs are read from the env file.
+        cfg_dir = self.home / ".jcode/plugins/self-improve"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        dead = free_port()
+        (cfg_dir / "env").write_text(
+            f"SELF_IMPROVE_ROUTER_URL=http://127.0.0.1:{self.port}/v1/chat/completions\n"
+            f"SELF_IMPROVE_CURATOR_URL=http://127.0.0.1:{dead}/v1/chat/completions\n"
+            f"SELF_IMPROVE_SKILL_THRESHOLD=0.5\n"
+            f"SELF_IMPROVE_GENOME_THRESHOLD=0.5\n"
+        )
+        res = self.run_turn()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assert_arm("curator-failed")
+        self.assertEqual(self.ledger_entries(), [])
+
     def test_parser_ignores_curation_nothing(self):
         # Point the curator at a response that yields CURATION: nothing.
         self.server.write_text(GATEWAY_PY_NOTHING)
-        self.proc.terminate()
-        self.proc.wait(timeout=3)
-        self.proc = subprocess.Popen(
-            [sys.executable, str(self.server)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        for _ in range(100):
-            try:
-                import socket
-
-                s = socket.create_connection(("127.0.0.1", self.port), timeout=0.1)
-                s.close()
-                break
-            except OSError:
-                time.sleep(0.05)
+        self.restart_gateway()
         res = self.run_turn()
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(self.ledger_entries(), [])
@@ -457,18 +674,11 @@ GATEWAY_PY = r'''
 import json, http.server, socketserver, sys
 from pathlib import Path
 
-RECV = Path(__file__).with_name("received.jsonl")
+HERE = Path(__file__).parent
+RECV = HERE / "received.jsonl"
+ANSWER = HERE / "answer.txt"
 
 ROUTER_ANSWER = json.dumps({"skill_worthy": 0.9, "genome_worthy": 0.9})
-CURATOR_SKILL_ANSWER = (
-    "Reviewed the turn. The user hit a race in a polling loop.\n\n"
-    "CURATION: debugging a flaky test | Wait on a condition variable, never sleep-and-poll, because sleep is racy | the test failed intermittently and passed with a cv wait | high\n"
-)
-CURATOR_GENOME_ANSWER = (
-    "This turn made a project decision.\n\n"
-    "GENOME: phase 2 started | nothing skipped\n"
-    "CURATION: nothing\n"
-)
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -478,16 +688,13 @@ class H(http.server.BaseHTTPRequestHandler):
         with RECV.open("a") as f:
             f.write(body + "\n")
         # The plugin sends one model per call: router first, then curator.
-        # Distinguish by the prompt's opening words.
+        # Distinguish by the prompt's opening words. The curator answer is read
+        # per request so a test can change it without restarting the server.
         is_router = "evaluating whether a completed agent turn" in body
         if is_router:
             payload = {"choices": [{"message": {"content": ROUTER_ANSWER}}]}
         else:
-            prompt = json.loads(body)["messages"][0]["content"]
-            if "genome curator" in prompt:
-                payload = {"choices": [{"message": {"content": CURATOR_GENOME_ANSWER}}]}
-            else:
-                payload = {"choices": [{"message": {"content": CURATOR_SKILL_ANSWER}}]}
+            payload = {"choices": [{"message": {"content": ANSWER.read_text()}}]}
         out = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -496,12 +703,12 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(out)
 
 socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", 18977), H) as httpd:
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H) as httpd:
     httpd.serve_forever()
 '''
 
 GATEWAY_PY_NOTHING = r'''
-import json, http.server, socketserver
+import json, http.server, socketserver, sys
 ROUTER_ANSWER = json.dumps({"skill_worthy": 0.9, "genome_worthy": 0.0})
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -520,13 +727,13 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(out)
 socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", 18977), H) as httpd:
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H) as httpd:
     httpd.serve_forever()
 '''
 
 
 PATH_SERVER_PY = r'''
-import http.server, socketserver
+import http.server, socketserver, sys
 from pathlib import Path
 
 LOGPATH = Path(__file__).with_name("paths.log")
@@ -547,7 +754,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(out)
 
 socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", 18978), H) as httpd:
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H) as httpd:
     httpd.serve_forever()
 '''
 

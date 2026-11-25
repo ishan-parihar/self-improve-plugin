@@ -40,6 +40,10 @@ for _cfg in "$HOME/.jcode/self-improve/env" "$HOME/.jcode/plugins/self-improve/e
 done
 
 ROUTE_URL="${SELF_IMPROVE_ROUTER_URL:-https://aroute.ishanparihar.com/v1/chat/completions}"
+# Curator calls default to the router URL. A separate knob exists so a curator
+# failure is reachable and testable: without it the curator could only fail by
+# taking the router down with it, so the curator-failed arm had no way to fire.
+CURATOR_URL="${SELF_IMPROVE_CURATOR_URL:-$ROUTE_URL}"
 ROUTE_MODEL="${SELF_IMPROVE_ROUTER_MODEL:-small-stack}"
 CURATOR_MODEL="${SELF_IMPROVE_CURATOR_MODEL:-large-stack}"
 SKILL_THRESHOLD="${SELF_IMPROVE_SKILL_THRESHOLD:-0.65}"
@@ -58,20 +62,36 @@ if [[ -z "${AROUTE_API_KEY:-}" && -f "$HOME/.config/jcode/provider-aroute.env" ]
   set -a; source "$HOME/.config/jcode/provider-aroute.env"; set +a
 fi
 
+# Helpers are defined before the key check so the one diagnostic this early path
+# writes uses the same JSON writer as every other record. A second printf here
+# would be the exact duplication finding: two writers, one of them unescaped.
+log_diag() {
+  local kind="$1"; shift
+  LOG_KIND="$kind" DIAG_PATH="$DIAGNOSTICS" python3 -c '
+import json, os, sys, datetime
+entry = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+         "kind": os.environ["LOG_KIND"]}
+args = sys.argv[1:]
+# Callers pass "key=value" chunks. A value that itself contains "=" must stay
+# whole, so split on the FIRST "=" only. Splitting on a bare space would break a
+# value carrying a space, which is every cue and every reason phrase.
+for chunk in args:
+    key, sep, value = chunk.partition("=")
+    if not sep:
+        raise SystemExit("log_diag: chunk has no '=' -> %r" % chunk)
+    entry[key] = value
+with open(os.environ["DIAG_PATH"], "a") as fh:
+    fh.write(json.dumps(entry) + "\n")
+' "$@"
+}
+
 # Fail fast if no API key — every call below needs it
 if [[ -z "${AROUTE_API_KEY:-}" ]]; then
-  ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-  printf '{"at":"%s","kind":"skip","reason":"no_api_key"}\n' "$ts" >> "$DIAGNOSTICS"
+  log_diag "skip" "reason=no_api_key"
   exit 0
 fi
 
-# Helpers
-log_diag() {
-  local kind="$1"; shift
-  local ts
-  ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-  printf '{"at":"%s","kind":"%s",%s}\n' "$ts" "$kind" "$*" >> "$DIAGNOSTICS"
-}
+# Helpers (defined above, before the key check, so every path writes JSON)
 
 # Rate limiter: count entries in state files within the last hour.
 # Two scopes: per-session (MAX_PER_HOUR) and profile-wide (MAX_PROFILE_PER_HOUR).
@@ -93,7 +113,7 @@ check_rate_limit() {
   fi
 
   if (( count >= MAX_PER_HOUR )); then
-    log_diag "cap" "\"scope\":\"session\",\"spawned\":$count"
+    log_diag "cap" "scope=session" "spawned=$count"
     return 1
   fi
 
@@ -106,7 +126,7 @@ check_rate_limit() {
   fi
 
   if (( pcount >= MAX_PROFILE_PER_HOUR )); then
-    log_diag "cap" "\"scope\":\"profile\",\"spawned\":$pcount"
+    log_diag "cap" "scope=profile" "spawned=$pcount"
     return 1
   fi
 
@@ -130,8 +150,26 @@ record_spawn() {
   awk -v cutoff="$cutoff" '$1 > cutoff' "$profile_file" > "$profile_file.tmp" && mv "$profile_file.tmp" "$profile_file"
 }
 
-# Prune state files older than STATE_TTL_SECS and cap the ledger at MAX_LEDGER_ENTRIES.
-# Runs once per invocation, off the hot path (the router call dominates latency anyway).
+# Cap one JSONL file at MAX_LEDGER_ENTRIES via an atomic rewrite. The ledger and the
+# diagnostics file are both append-only products this plugin owns, so they share one
+# cap rather than one cap for the ledger and none for the audit trail.
+cap_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local lines
+  lines=$(wc -l < "$file" 2>/dev/null || echo 0)
+  (( lines > MAX_LEDGER_ENTRIES )) || return 0
+  local tmp="$file.tmp.$$"
+  if tail -n "$MAX_LEDGER_ENTRIES" "$file" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# Prune state files older than STATE_TTL_SECS and cap the two JSONL files at
+# MAX_LEDGER_ENTRIES. Runs once per invocation, off the hot path (the router call
+# dominates latency anyway).
 housekeeping() {
   # Delete per-session spawn files NOT modified within STATE_TTL_SECS.
   # The profile file is rewritten in place and pruned by record_spawn, so it is
@@ -141,16 +179,8 @@ housekeeping() {
       -mmin +"$(( STATE_TTL_SECS / 60 ))" -delete 2>/dev/null || true
   fi
 
-  # Cap the ledger at the last MAX_LEDGER_ENTRIES lines (atomic rewrite via tmp file).
-  if [[ -f "$LEDGER" ]]; then
-    local lines
-    lines=$(wc -l < "$LEDGER" 2>/dev/null || echo 0)
-    if (( lines > MAX_LEDGER_ENTRIES )); then
-      local tmp="$LEDGER.tmp.$$"
-      tail -n "$MAX_LEDGER_ENTRIES" "$LEDGER" > "$tmp" 2>/dev/null \
-        && mv "$tmp" "$LEDGER" || rm -f "$tmp"
-    fi
-  fi
+  cap_file "$LEDGER"
+  cap_file "$DIAGNOSTICS"
 }
 
 build_digest() {
@@ -188,11 +218,14 @@ except:
 " 2>/dev/null) || true
   fi
 
-  # Truncate at sentence boundary before the char limit
+  # Truncate at a sentence boundary before the char limit. The floor is derived from
+  # the limit rather than a literal: a hardcoded 200 silently disabled the trim for
+  # any DIGEST_MAX_CHARS at or below it, so the knob did not do what its name said.
   if (( ${#truncated} >= DIGEST_MAX_CHARS )); then
     local last_period="${truncated:0:$DIGEST_MAX_CHARS}"
     last_period="${last_period%.*}"
-    if (( ${#last_period} > 200 )); then
+    local floor=$(( DIGEST_MAX_CHARS / 2 ))
+    if (( ${#last_period} > floor )); then
       truncated="${last_period}."
     fi
   fi
@@ -255,7 +288,7 @@ print(json.dumps({
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $AROUTE_API_KEY" \
     -d "$payload" 2>/dev/null) || {
-    log_diag "router-failed" "\"reason\":\"curl_failed\""
+    log_diag "router-failed" "reason=curl_failed"
     echo ''
     return 1
   }
@@ -271,8 +304,8 @@ try:
     for match in re.finditer(r'\{[^}]+\}', text):
         try:
             obj = json.loads(match.group())
-            skill = obj.get('skill_worthy')
-            genome = obj.get('genome_worthy')
+            skill = obj.get('skill_worthy', obj.get('skill'))
+            genome = obj.get('genome_worthy', obj.get('genome'))
             if isinstance(skill, (int, float)) and isinstance(genome, (int, float)):
                 print(json.dumps({'skill': float(skill), 'genome': float(genome)}))
                 break
@@ -306,11 +339,11 @@ print(json.dumps({
 
   local response
   response=$(curl -sS --connect-timeout 5 --max-time 120 \
-    -X POST "$ROUTE_URL" \
+    -X POST "$CURATOR_URL" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $AROUTE_API_KEY" \
     -d "$payload" 2>/dev/null) || {
-    log_diag "curator-failed" "\"branch\":\"$branch\",\"reason\":\"gateway_call_failed\""
+    log_diag "curator-failed" "branch=$branch" "reason=gateway_call_failed"
     return 1
   }
 
@@ -437,13 +470,22 @@ parse_and_record_curation() {
     fi
   fi
 
+  # A bare "GENOME: nothing" from the genome branch is the explicit no-op, not a
+  # parse failure: it must log curation-nothing like the skill branch does.
+  if [[ -z "$curation_line" && "$kind" == "genome" && -n "$genome_line" ]]; then
+    if printf '%s' "$genome_line" | grep -qiE 'GENOME:\s*nothing'; then
+      log_diag "curation-nothing" "branch=$kind"
+      return 0
+    fi
+  fi
+
   if [[ -z "$curation_line" ]]; then
-    log_diag "no-curation" "\"branch\":\"$kind\""
+    log_diag "no-curation" "branch=$kind"
     return 0
   fi
 
   if printf '%s' "$curation_line" | grep -qiE 'CURATION:\s*nothing'; then
-    log_diag "curation-nothing" "\"branch\":\"$kind\""
+    log_diag "curation-nothing" "branch=$kind"
     return 0
   fi
 
@@ -453,16 +495,19 @@ parse_and_record_curation() {
   local cue lesson evidence confidence
   IFS='|' read -ra parts <<< "$body"
 
-  if (( ${#parts[@]} < 3 )); then
-    log_diag "curation-parse-failed" "\"branch\":\"$kind\",\"parts\":${#parts[@]}"
-    return 0
-  fi
-
-  # Trim leading/trailing whitespace from each part
+  # Trim leading/trailing whitespace BEFORE the count check, so an empty field is
+  # visible. Trimming after the check made a two-part line report parse-failed
+  # instead of incomplete, which left the curation-incomplete arm unreachable: the
+  # count guard always fired first.
   for i in "${!parts[@]}"; do
     parts[$i]="${parts[$i]#"${parts[$i]%%[![:space:]]*}"}"
     parts[$i]="${parts[$i]%"${parts[$i]##*[![:space:]]}"}"
   done
+
+  if (( ${#parts[@]} < 3 )); then
+    log_diag "curation-parse-failed" "branch=$kind" "parts=${#parts[@]}"
+    return 0
+  fi
 
   cue="${parts[0]}"
 
@@ -487,28 +532,57 @@ parse_and_record_curation() {
   done
 
   if [[ -z "$cue" || -z "$lesson" || -z "$evidence" ]]; then
-    log_diag "curation-incomplete" "\"branch\":\"$kind\""
+    log_diag "curation-incomplete" "branch=$kind"
     return 0
   fi
 
   if [[ "$cue" == \<*\> ]] || [[ "$lesson" == \<*\> ]] || [[ "$evidence" == \<*\> ]]; then
-    log_diag "curation-template" "\"branch\":\"$kind\""
+    log_diag "curation-template" "branch=$kind"
     return 0
   fi
 
-  # Deduplicate: if the ledger already holds an entry with this exact cue, skip the
-  # write. The dsh version refuses near-duplicates this way; without it, the same
-  # lesson gets re-recorded every time the situation recurs, and the library grows
-  # with copies instead of getting stronger.
-  if [[ -f "$LEDGER" ]] && grep -Fq "\"cue\": \"${cue}\"" "$LEDGER" 2>/dev/null; then
-    log_diag "curation-duplicate" "\"branch\":\"$kind\",\"cue\":\"$(printf '%s' "$cue" | head -c 80 | tr '\n' ' ')\""
-    return 0
-  fi
+  # Deduplicate and append under one lock. Both curator branches run backgrounded on
+  # the same turn, so without the lock they both pass the check before either
+  # appends and the same cue lands twice; measured on the real plugin, one turn wrote
+  # two rows. The reader parses the ledger rather than grepping the literal
+  # `"cue": "..."` text, because a cue containing a quote or a backslash defeats a
+  # literal match and the duplicate is then written again.
+  {
+    flock 9
 
-  # Append to ledger atomically (small write < 4KB is atomic under POSIX)
-  local ts
-  ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-  python3 -c "
+    if LEDGER_PATH="$LEDGER" NEW_CUE="$cue" NEW_KIND="$kind" python3 -c '
+import json, os, sys
+path = os.environ["LEDGER_PATH"]
+cue = os.environ["NEW_CUE"]
+kind = os.environ["NEW_KIND"]
+try:
+    fh = open(path)
+except FileNotFoundError:
+    sys.exit(1)   # no ledger yet: nothing recorded, so write
+with fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue   # a truncated or foreign row must not block a write
+        # Both curator branches run on the same turn, so the key is (cue, kind):
+        # one turn may legitimately yield one skill row and one genome row, but
+        # never two of the same kind.
+        if entry.get("cue") == cue and entry.get("kind") == kind:
+            sys.exit(0)   # already recorded
+    sys.exit(1)
+'; then
+      log_diag "curation-duplicate" "branch=$kind" "cue=$(printf '%s' "$cue" | head -c 80 | tr '\n' ' ')"
+      exit 0
+    fi
+
+    # Append to ledger atomically (small write < 4KB is atomic under POSIX)
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+    python3 -c "
 import json, sys
 entry = {
     'cue': sys.argv[1],
@@ -523,10 +597,11 @@ entry = {
 }
 print(json.dumps(entry))
 " "$cue" "$lesson" "$evidence" "$confidence" "$kind" "$ts" "$turn_ref" >> "$LEDGER"
+  } 9>"$STATE_DIR/ledger.lock"
 
   local cue_short
   cue_short=$(printf '%s' "$cue" | head -c 80 | tr '\n' ' ')
-  log_diag "curation-recorded" "\"branch\":\"$kind\",\"cue\":\"$cue_short\""
+  log_diag "curation-recorded" "branch=$kind" "cue=$cue_short"
 
   # Share the lesson with memory-wire, verbatim from the plugin's own memory contract.
   #
@@ -538,7 +613,10 @@ print(json.dumps(entry))
   # Set SELF_IMPROVE_MEMORY_URL to the BASE (e.g. http://127.0.0.1:8888) and the
   # bank is appended here, matching how the hermes integration resolves them
   # (MEMORY_WIRE_URL + MEMORY_WIRE_BANK, then the saved config, then the defaults).
-  local mem_base="$SELF_IMPROVE_MEMORY_URL"
+  # "${VAR:-}" not "$VAR": the script runs under `set -u`, so a bare unset name
+  # aborts the whole hook. An unset share URL is the default (sharing is opt-in), so
+  # reading it must be an empty string, not a fatal error.
+  local mem_base="${SELF_IMPROVE_MEMORY_URL:-}"
   local mem_bank="${SELF_IMPROVE_MEMORY_BANK:-memory-wire}"
 
   # Do not fail on an unreachable server: a memory share that fails must never
@@ -558,10 +636,22 @@ print(json.dumps({
           -X POST "${mem_base}/banks/${mem_bank}/retain" \
           -H "Content-Type: application/json" \
           -d "$payload" \
-          >/dev/null 2>&1 || log_diag "memory-failed" "\"branch\":\"$kind\",\"reason\":\"unreachable\""
+          >/dev/null 2>&1 || log_diag "memory-failed" "branch=$kind" "reason=unreachable"
     fi
   fi
 }
+
+# Cap both JSONL files on EXIT, not only during housekeeping. housekeeping
+# runs before this turn writes, so a turn whose own rows push the file past the
+# cap ends one line over and only shrinks on the next turn. Every exit path
+# (no assistant text, rate limited, router failed, success) reaches EXIT, so one
+# trap covers them all. The trap holds no state beyond the two paths, so it is
+# safe to re-enter from a subshell.
+cleanup_on_exit() {
+  cap_file "$LEDGER"
+  cap_file "$DIAGNOSTICS"
+}
+trap cleanup_on_exit EXIT
 
 main() {
   # Off the hot path: prune stale state files and cap the ledger.
@@ -571,7 +661,7 @@ main() {
   digest=$(build_digest)
 
   if [[ -z "${JCODE_HOOK_LAST_ASSISTANT_TEXT:-}" ]]; then
-    log_diag "skip" "\"reason\":\"no_assistant_text\""
+    log_diag "skip" "reason=no_assistant_text"
     exit 0
   fi
 
@@ -594,7 +684,7 @@ main() {
   skill_score=$(printf '%s' "$scores" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("skill",0))' 2>/dev/null || echo "0")
   genome_score=$(printf '%s' "$scores" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("genome",0))' 2>/dev/null || echo "0")
 
-  log_diag "router" "\"skill\":$skill_score,\"genome\":$genome_score"
+  log_diag "router" "skill=$skill_score" "genome=$genome_score"
 
   local turn_ref="${JCODE_HOOK_SESSION_ID:-unknown}"
 
@@ -617,7 +707,7 @@ main() {
   fi
 
   if [[ "$skill_fire" != "1" && "$genome_fire" != "1" ]]; then
-    log_diag "router" "\"branch\":\"none\",\"skill\":$skill_score,\"genome\":$genome_score"
+    log_diag "router" "branch=none" "skill=$skill_score" "genome=$genome_score"
   fi
 
   # Wait for background curators to finish.
