@@ -24,20 +24,43 @@ if [[ "${JCODE_HOOK_STATUS:-}" != "ok" ]]; then
 fi
 
 # Config
-LEDGER="$HOME/.jcode/self-improve/ledger.jsonl"
-DIAGNOSTICS="$HOME/.jcode/self-improve/diagnostics.jsonl"
-STATE_DIR="$HOME/.jcode/self-improve/state"
+# Paths, the env file, the JSON writer, the ledger cap and the bank ladder all
+# live in lib/common.sh, which dream.sh sources too. They used to be copied here,
+# and the copies drifted: the dream stage kept a different ledger, skipped the env
+# file, and derived bank names that disagreed on case.
+SELF_IMPROVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+if [[ -f "$SELF_IMPROVE_DIR/lib/common.sh" ]]; then
+  source "$SELF_IMPROVE_DIR/lib/common.sh"
+fi
+
+# Fallbacks for a source tree that ships the script without lib/. The live install
+# always has it; these keep a bare copy of the script working rather than aborting
+# under `set -u`.
+: "${SELF_IMPROVE_LEDGER:=$HOME/.jcode/self-improve/ledger.jsonl}"
+: "${SELF_IMPROVE_DIAGNOSTICS:=$HOME/.jcode/self-improve/diagnostics.jsonl}"
+: "${SELF_IMPROVE_STATE_ROOT:=$HOME/.jcode/self-improve}"
+: "${SELF_IMPROVE_MAX_LEDGER_ENTRIES:=500}"
+: "${SELF_IMPROVE_STATE_TTL_SECS:=86400}"
+LEDGER="$SELF_IMPROVE_LEDGER"
+DIAGNOSTICS="$SELF_IMPROVE_DIAGNOSTICS"
+STATE_DIR="$SELF_IMPROVE_STATE_ROOT/state"
 
 # Plugin-local settings, sourced before the defaults below. A hook cannot be given
 # environment variables from config.toml, so the knobs live in one file next to the
 # script instead: same pattern as the aroute credential file, and it keeps the
-# hook command in config.toml a single path.
+# hook command in config.toml a single path. dream.sh reads the SAME file through
+# common.sh, so a knob is set once for the whole loop.
 #   SELF_IMPROVE_MEMORY_URL=http://127.0.0.1:8888
 #   SELF_IMPROVE_MEMORY_BANK=omp
-for _cfg in "$HOME/.jcode/self-improve/env" "$HOME/.jcode/plugins/self-improve/env"; do
-  # shellcheck source=/dev/null
-  [[ -f "$_cfg" ]] && { set -a; . "$_cfg"; set +a; }
-done
+if declare -F self_improve_load_env >/dev/null 2>&1; then
+  self_improve_load_env
+else
+  for _cfg in "$HOME/.jcode/self-improve/env" "$HOME/.jcode/plugins/self-improve/env"; do
+    # shellcheck source=/dev/null
+    [[ -f "$_cfg" ]] && { set -a; . "$_cfg"; set +a; }
+  done
+fi
 
 ROUTE_URL="${SELF_IMPROVE_ROUTER_URL:-https://aroute.ishanparihar.com/v1/chat/completions}"
 # Curator calls default to the router URL. A separate knob exists so a curator
@@ -52,8 +75,6 @@ MAX_PER_HOUR="${SELF_IMPROVE_MAX_PER_HOUR:-6}"
 MAX_PROFILE_PER_HOUR="${SELF_IMPROVE_MAX_PROFILE_PER_HOUR:-24}"
 DIGEST_MAX_CHARS="${SELF_IMPROVE_DIGEST_MAX_CHARS:-4000}"
 ROUTER_MAX_TOKENS="${SELF_IMPROVE_ROUTER_MAX_TOKENS:-2000}"
-MAX_LEDGER_ENTRIES="${SELF_IMPROVE_MAX_LEDGER_ENTRIES:-500}"
-STATE_TTL_SECS="${SELF_IMPROVE_STATE_TTL_SECS:-86400}"
 
 mkdir -p "$(dirname "$LEDGER")" "$STATE_DIR"
 
@@ -61,29 +82,6 @@ mkdir -p "$(dirname "$LEDGER")" "$STATE_DIR"
 if [[ -z "${AROUTE_API_KEY:-}" && -f "$HOME/.config/jcode/provider-aroute.env" ]]; then
   set -a; source "$HOME/.config/jcode/provider-aroute.env"; set +a
 fi
-
-# Helpers are defined before the key check so the one diagnostic this early path
-# writes uses the same JSON writer as every other record. A second printf here
-# would be the exact duplication finding: two writers, one of them unescaped.
-log_diag() {
-  local kind="$1"; shift
-  LOG_KIND="$kind" DIAG_PATH="$DIAGNOSTICS" python3 -c '
-import json, os, sys, datetime
-entry = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-         "kind": os.environ["LOG_KIND"]}
-args = sys.argv[1:]
-# Callers pass "key=value" chunks. A value that itself contains "=" must stay
-# whole, so split on the FIRST "=" only. Splitting on a bare space would break a
-# value carrying a space, which is every cue and every reason phrase.
-for chunk in args:
-    key, sep, value = chunk.partition("=")
-    if not sep:
-        raise SystemExit("log_diag: chunk has no '=' -> %r" % chunk)
-    entry[key] = value
-with open(os.environ["DIAG_PATH"], "a") as fh:
-    fh.write(json.dumps(entry) + "\n")
-' "$@"
-}
 
 # Fail fast if no API key — every call below needs it
 if [[ -z "${AROUTE_API_KEY:-}" ]]; then
@@ -150,33 +148,17 @@ record_spawn() {
   awk -v cutoff="$cutoff" '$1 > cutoff' "$profile_file" > "$profile_file.tmp" && mv "$profile_file.tmp" "$profile_file"
 }
 
-# Cap one JSONL file at MAX_LEDGER_ENTRIES via an atomic rewrite. The ledger and the
-# diagnostics file are both append-only products this plugin owns, so they share one
-# cap rather than one cap for the ledger and none for the audit trail.
-cap_file() {
-  local file="$1"
-  [[ -f "$file" ]] || return 0
-  local lines
-  lines=$(wc -l < "$file" 2>/dev/null || echo 0)
-  (( lines > MAX_LEDGER_ENTRIES )) || return 0
-  local tmp="$file.tmp.$$"
-  if tail -n "$MAX_LEDGER_ENTRIES" "$file" > "$tmp" 2>/dev/null; then
-    mv "$tmp" "$file"
-  else
-    rm -f "$tmp"
-  fi
-}
-
-# Prune state files older than STATE_TTL_SECS and cap the two JSONL files at
-# MAX_LEDGER_ENTRIES. Runs once per invocation, off the hot path (the router call
-# dominates latency anyway).
+# Prune state files older than SELF_IMPROVE_STATE_TTL_SECS and cap the two JSONL
+# files at SELF_IMPROVE_MAX_LEDGER_ENTRIES. Runs once per invocation, off the hot
+# path (the router call dominates latency anyway). Both knobs and cap_file come
+# from common.sh, so the dream stage caps the same ledger the same way.
 housekeeping() {
-  # Delete per-session spawn files NOT modified within STATE_TTL_SECS.
+  # Delete per-session spawn files NOT modified within SELF_IMPROVE_STATE_TTL_SECS.
   # The profile file is rewritten in place and pruned by record_spawn, so it is
   # never deleted here; its age never matters, only its contents do.
   if [[ -d "$STATE_DIR" ]]; then
     find "$STATE_DIR" -maxdepth 1 -type f -name 'spawns-*' ! -name 'spawns-profile' \
-      -mmin +"$(( STATE_TTL_SECS / 60 ))" -delete 2>/dev/null || true
+      -mmin +"$(( SELF_IMPROVE_STATE_TTL_SECS / 60 ))" -delete 2>/dev/null || true
   fi
 
   cap_file "$LEDGER"
@@ -453,90 +435,6 @@ ${digest}"
 # filesystem walk is deliberate over `git rev-parse`: a spawned git collapses a
 # missing binary, a timeout and "not a repository" into one answer, and a hook
 # cannot tell a transient failure from the real thing.
-memory_wire_derive_bank() {
-  local dir="${1:-$PWD}"
-  MEM_DERIVE_DIR="$dir" python3 - <<'PY' 2>/dev/null || echo memory-wire
-import os, re, sys
-
-def sanitize(raw):
-    mapped = "".join(
-        c.lower() if (c.isascii() and (c.isalnum() or c in "-_.")) else "-"
-        for c in raw
-    )
-    trimmed = mapped.strip("-.")
-    return trimmed or None
-
-def worktree_root(d):
-    cur = os.path.abspath(d)
-    while True:
-        if os.path.exists(os.path.join(cur, ".git")):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            return None
-        cur = parent
-
-def origin_url(root):
-    cfg = os.path.join(root, ".git", "config")
-    # A worktree's .git is a file pointing elsewhere; read through it.
-    if os.path.isfile(cfg):
-        try:
-            target = open(cfg).read().strip()
-            if target.startswith("gitdir:"):
-                gd = target.split(":", 1)[1].strip()
-                cfg = os.path.join(root, gd, "config")
-        except OSError:
-            return None
-    try:
-        text = open(cfg, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return None
-    in_origin = False
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("["):
-            in_origin = line.lower().startswith('[remote "origin"]')
-            continue
-        if not in_origin or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        if k.strip().lower() == "url" and v.strip():
-            return v.strip()
-    return None
-
-def owner_repo(url):
-    url = url.strip().rstrip("/")
-    if "://" in url:
-        rest = url.split("://", 1)[1]
-        if "/" not in rest:
-            return None
-        path = rest.split("/", 1)[1]
-    else:
-        if ":" not in url:
-            return None
-        path = url.rsplit(":", 1)[1]
-    if path.endswith(".git"):
-        path = path[: -len(".git")]
-    segs = [s for s in path.split("/") if s]
-    if len(segs) < 2:
-        return None
-    return f"{segs[-2]}/{segs[-1]}"
-
-d = os.environ.get("MEM_DERIVE_DIR") or os.getcwd()
-root = worktree_root(d)
-bank = None
-if root:
-    url = origin_url(root)
-    if url:
-        orp = owner_repo(url)
-        if orp:
-            bank = sanitize(orp)
-if not bank:
-    bank = sanitize(os.path.basename(os.path.normpath(os.path.abspath(d))))
-print(bank or "memory-wire")
-PY
-}
-
 parse_and_record_curation() {
   local response="$1"
   local kind="$2"
@@ -733,10 +631,11 @@ print(json.dumps(entry))
   # shared bank is what keeps each project's facts in its own namespace: a single
   # bank makes every project's memory recallable in every other project's context,
   # and it makes the hygiene scan O(n^2) over everyone's rows at once.
-  local mem_bank="${SELF_IMPROVE_MEMORY_BANK:-}"
-  if [[ -z "$mem_bank" ]]; then
-    mem_bank=$(memory_wire_derive_bank "${JCODE_HOOK_CWD:-$PWD}")
-  fi
+  # One resolver for the whole loop (common.sh): explicit env, then
+  # MEMORY_WIRE_BANK, then owner/repo from the origin, then the directory name.
+  # dream.sh calls the same function, so both stages address the same bank.
+  local mem_bank
+  mem_bank=$(memory_wire_resolve_bank "${JCODE_HOOK_CWD:-$PWD}")
 
   # A skill lesson is transferable across projects, so it is never a project fact.
   # Writing it to memory would put one project's procedure into every project's

@@ -578,6 +578,43 @@ class FakeGatewayTest(unittest.TestCase):
             logged,
         )
 
+    def test_bank_ladder_agrees_on_case_for_every_url_shape(self):
+        """Both stages derive the SAME bank for every remote shape.
+
+        The audit found two ladders that disagreed: a regex in dream.sh returned
+        "Owner-Repo" where the canonical parser returned "owner-repo", and real
+        banks are all lowercase. One project, two banks, split memory. The fake
+        HOME gets a real .git/config per shape, and the derived name must be
+        lowercase in every case.
+        """
+        shapes = {
+            "https": "https://github.com/Owner/Repo.git",
+            "ssh": "[REDACTED:email]:Owner/Repo.git",
+            "no-dotgit": "https://github.com/Owner/Repo",
+            "deep": "https://gitlab.com/group/sub/Owner/Repo.git",
+        }
+        for name, url in shapes.items():
+            with self.subTest(shape=name):
+                repo = self.home / f"proj-{name}"
+                (repo / ".git").mkdir(parents=True)
+                (repo / ".git" / "config").write_text(
+                    '[core]\n\trepositoryformatversion = 0\n\n'
+                    f'[remote "origin"]\n\turl = {url}\n'
+                )
+                out = subprocess.run(
+                    ["bash", "-c",
+                     'source "$1"; memory_wire_resolve_bank "$2"',
+                     "probe", str(ROOT / "lib/common.sh"), str(repo)],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(ROOT),
+                    env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+                )
+                self.assertEqual(out.returncode, 0, out.stderr)
+                bank = out.stdout.strip()
+                self.assertEqual(bank, bank.lower(), f"{name}: {bank!r} is not lowercase")
+                self.assertNotIn("/", bank, f"{name}: {bank!r} still carries a path separator")
+                self.assertTrue(bank.endswith("owner-repo"), f"{name}: {bank!r}")
+
     def test_memory_share_carries_the_project_fact_not_the_lesson(self):
         """The shared content is the project fact, tagged as one."""
         paths_file = self.home / "paths.log"
@@ -1023,11 +1060,11 @@ class DreamTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
-        # dream.sh defaults to $HOME/.jcode/hooks/self-improve/, which is the
-        # live ledger's real location. Pointing this at the home root instead
-        # made every case fail on an empty list rather than on behaviour.
-        self.ledger = self.home / ".jcode/hooks/self-improve/ledger.jsonl"
-        self.state_dir = self.home / ".jcode/hooks/self-improve/dream"
+        # Both stages now write the ONE ledger from common.sh. Asserting a dream
+        # record lands beside a turn record is the whole point of the fix: the
+        # dream stage used to keep its own book nobody read.
+        self.ledger = self.home / ".jcode/self-improve/ledger.jsonl"
+        self.state_dir = self.home / ".jcode/self-improve/dream"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -1060,9 +1097,13 @@ class DreamTest(unittest.TestCase):
                 "JCODE_HOOK_CWD": str(self.home),
                 "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
                 "SELF_IMPROVE_MEMORY_BANK": bank,
-                # A separate state dir per home keeps one test's day-stamp from
+                # A separate state root per home keeps one test's day-stamp from
                 # leaking into the next test's opinion of whether the pass ran.
-                "SELF_IMPROVE_STATE_DIR": str(self.state_dir),
+                "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                # The shared ledger, pointed into the sandbox. Without this the
+                # test would read the operator's real ledger.
+                "SELF_IMPROVE_LEDGER": str(self.ledger),
+                "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
             },
             home=self.home,
         )
@@ -1153,6 +1194,123 @@ class DreamTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         stamps = list(self.state_dir.glob("*.last"))
         self.assertEqual(stamps, [], stamps)
+
+    def test_env_file_supplies_the_memory_url(self):
+        """dream.sh reads the SAME env file the turn loop reads.
+
+        It used to hardcode the URL and ignore the file, so the two stages could
+        be pointed at different memory by editing one place. The URL is set only
+        in the env file here, so a pass that reaches the server proves the file
+        was sourced.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        cfg = self.home / ".jcode/plugins/self-improve/env"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(f"SELF_IMPROVE_MEMORY_URL=http://127.0.0.1:{port}\n")
+        try:
+            # No URL in the environment: only the file can supply it.
+            res = run_dream(
+                {
+                    "JCODE_HOOK_ID": "env1",
+                    "JCODE_HOOK_CWD": str(self.home),
+                    "SELF_IMPROVE_MEMORY_BANK": "b1",
+                    "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                    "SELF_IMPROVE_LEDGER": str(self.ledger),
+                    "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+                },
+                home=self.home,
+            )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual([d["outcome"] for d in self._dreams()], ["clean"], self._dreams())
+
+    def test_no_memory_url_is_disabled_not_an_error(self):
+        """A host without memory-wire still closes its session cleanly."""
+        res = run_dream(
+            {
+                "JCODE_HOOK_ID": "nolink",
+                "JCODE_HOOK_CWD": str(self.home),
+                "SELF_IMPROVE_MEMORY_BANK": "b1",
+                "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                "SELF_IMPROVE_LEDGER": str(self.ledger),
+                "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+            },
+            home=self.home,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual([d["outcome"] for d in self._dreams()], ["disabled"], self._dreams())
+
+    def test_dream_and_turn_share_one_ledger(self):
+        """A dream record and a turn record land in the SAME file.
+
+        This is the defect the audit found: dream.sh wrote
+        ~/.jcode/hooks/self-improve/ledger.jsonl while the turn loop wrote
+        ~/.jcode/self-improve/ledger.jsonl, so the consolidation was invisible to
+        every reader of the real ledger. The turn row is written by hand here
+        because driving a whole turn needs a router; what is under test is that
+        the dream stage appends to the file the turn stage already owns.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text(
+            json.dumps({"ts": "t", "kind": "skill", "cue": "c", "lesson": "l"}) + "\n"
+        )
+        try:
+            self.assertEqual(self._run(port, "b1").returncode, 0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        rows = read_jsonl(self.ledger)
+        kinds = [r.get("kind") for r in rows]
+        self.assertIn("skill", kinds, kinds)
+        self.assertIn("dream", kinds, kinds)
+        # One row per line: a missing newline would merge two records into one.
+        raw = self.ledger.read_text().splitlines()
+        self.assertEqual(len(raw), len(rows), raw)
+
+    def test_dream_ledger_is_capped(self):
+        """The dream stage caps the shared ledger; it used to have no cap."""
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text("".join(
+            json.dumps({"i": i}) + "\n" for i in range(600)
+        ))
+        try:
+            res = run_dream(
+                {
+                    "JCODE_HOOK_ID": "cap",
+                    "JCODE_HOOK_CWD": str(self.home),
+                    "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
+                    "SELF_IMPROVE_MEMORY_BANK": "b1",
+                    "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                    "SELF_IMPROVE_LEDGER": str(self.ledger),
+                    "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+                    "SELF_IMPROVE_MAX_LEDGER_ENTRIES": "50",
+                },
+                home=self.home,
+            )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertLessEqual(len(read_jsonl(self.ledger)), 50, len(read_jsonl(self.ledger)))
 
 
 PATH_SERVER_PY = r'''
