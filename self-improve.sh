@@ -452,12 +452,22 @@ parse_and_record_curation() {
   local curation_line
   curation_line=$(printf '%s' "$response" | grep -i 'CURATION:' | tail -1) || true
 
-  # Fallback for the genome branch: the prompt asks for a GENOME: line first, and a
-  # model may emit only that line, skipping CURATION. Without this the genome fact is
-  # silently lost. The GENOME line is a different shape ('what recorded | what skipped'),
-  # so it is mapped onto cue=the recorded part and evidence=the skipped part.
+  # True when the model explicitly said no: "CURATION: nothing" / "GENOME: nothing".
+  # The genome prompt asks for a GENOME line and THEN a CURATION line, and a model
+  # that recorded a real project fact still writes "CURATION: nothing" because the
+  # fact was not a transferable lesson. Treating that as the end discards the fact.
+  local curation_is_nothing=0
+  if printf '%s' "$curation_line" | grep -qiE 'CURATION:\s*nothing'; then
+    curation_is_nothing=1
+  fi
+
+  # Fallback for the genome branch: use the GENOME line when there is no usable
+  # CURATION line, i.e. when it is absent OR explicitly "nothing". A model may also
+  # emit only the GENOME line and skip CURATION entirely. The GENOME line is a
+  # different shape ('what recorded | what skipped'), so it is mapped onto
+  # cue=the recorded part and evidence=the skipped part.
   local genome_line=""
-  if [[ -z "$curation_line" && "$kind" == "genome" ]]; then
+  if [[ "$kind" == "genome" && ( -z "$curation_line" || "$curation_is_nothing" == "1" ) ]]; then
     genome_line=$(printf '%s' "$response" | grep -i 'GENOME:' | tail -1) || true
     if [[ -n "$genome_line" ]] && ! printf '%s' "$genome_line" | grep -qiE 'GENOME:\s*nothing'; then
       local gbody
@@ -466,6 +476,7 @@ parse_and_record_curation() {
       IFS='|' read -r grecorded gskipped <<< "$gbody"
       if [[ -n "$grecorded" ]]; then
         curation_line="CURATION: ${grecorded} | recorded from a completed turn for this project | ${gskipped:-no second field given}"
+        curation_is_nothing=0
       fi
     fi
   fi
@@ -479,13 +490,12 @@ parse_and_record_curation() {
     fi
   fi
 
-  if [[ -z "$curation_line" ]]; then
-    log_diag "no-curation" "branch=$kind"
-    return 0
-  fi
-
-  if printf '%s' "$curation_line" | grep -qiE 'CURATION:\s*nothing'; then
-    log_diag "curation-nothing" "branch=$kind"
+  if [[ -z "$curation_line" || "$curation_is_nothing" == "1" ]]; then
+    if [[ "$curation_is_nothing" == "1" ]]; then
+      log_diag "curation-nothing" "branch=$kind"
+    else
+      log_diag "no-curation" "branch=$kind"
+    fi
     return 0
   fi
 

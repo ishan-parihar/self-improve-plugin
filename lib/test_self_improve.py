@@ -634,6 +634,46 @@ class FakeGatewayTest(unittest.TestCase):
         self.run_turn(curator_answer="CURATION: <cue> | <lesson> | <evidence>")
         self.assert_arm("curation-template")
 
+    def test_genome_fact_survives_curation_nothing(self):
+        """A genome fact must survive an explicit `CURATION: nothing`.
+
+        The genome prompt asks for the GENOME line FIRST and then a CURATION line,
+        and a model that recorded a real project fact still writes
+        `CURATION: nothing` because the fact was not a transferable lesson.
+        Measured live: the plugin logged curation-nothing and the fact was lost.
+        The fallback therefore runs on explicit-nothing, not only on absence.
+        """
+        answer = (
+            "GENOME: the self-improve plugin is a git-tracked public repo and "
+            "aroute.ishanparihar.com is the required router (operator rulings) | "
+            "not recording the rationale, because none was stated\n"
+            "CURATION: nothing\n"
+        )
+        res = self.run_turn(curator_answer=answer)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rows = [e for e in self.ledger_entries() if e.get("kind") == "genome"]
+        self.assertEqual(len(rows), 1, self.ledger_entries())
+        self.assertIn("git-tracked public repo", rows[0]["cue"])
+        # The genome branch must not report nothing. The skill branch got the same
+        # reply and correctly did, so scope the assertion to the genome branch.
+        self.assertFalse(
+            any(
+                d.get("kind") == "curation-nothing"
+                and d.get("branch") == "genome"
+                for d in self.diags()
+            ),
+            self.diags(),
+        )
+
+    def test_genome_nothing_still_logs_curation_nothing(self):
+        """An explicit double-nothing is still the no-op, not a record."""
+        res = self.run_turn(
+            curator_answer="GENOME: nothing\nCURATION: nothing\n"
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.ledger_entries(), [])
+        self.assert_arm("curation-nothing")
+
     def test_arm_no_curation(self):
         """A reply with no CURATION line at all logs no-curation."""
         self.run_turn(curator_answer="I found nothing worth writing down.")
