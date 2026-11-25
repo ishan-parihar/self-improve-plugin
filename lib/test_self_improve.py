@@ -278,21 +278,27 @@ class FakeGatewayTest(unittest.TestCase):
     plugin touches is HTTP POST to ROUTE_URL, so a loopback stub exercises the
     router, curator, parser, dedup and ledger write paths for real."""
 
-    def _spawn_gateway(self) -> None:
+    def _spawn_gateway(self, skill_only: bool = False) -> None:
         """Start the fake gateway on a FRESH port, keeping stderr.
 
         A fresh port matters: reusing one after terminate lets the dying socket
         answer the readiness probe while the new bind is still pending, so the
         plugin's curl then fails. stderr is captured to a file so a startup
         failure reports its cause instead of timing out as "did not start".
+
+        ``skill_only`` scores genome 0.0, so a case can exercise the skill branch
+        without the genome branch firing alongside it.
         """
         self.port = free_port()
         self.server_err.seek(0)
         self.server_err.truncate()
+        env = dict(os.environ)
+        env["SKILL_ONLY"] = "1" if skill_only else "0"
         self.proc = subprocess.Popen(
             [sys.executable, str(self.server), str(self.port)],
             stdout=subprocess.DEVNULL,
             stderr=self.server_err,
+            env=env,
         )
 
     def setUp(self) -> None:
@@ -380,8 +386,24 @@ class FakeGatewayTest(unittest.TestCase):
             "SELF_IMPROVE_GENOME_THRESHOLD": "0.5",
         }
         if mem_url is not None:
-            env["SELF_IMPROVE_MEMORY_URL"] = mem_url
+            # The plugin sources its own env file AFTER the process env, so a
+            # variable set only in the process env loses to whatever the file says.
+            # Write the case's URL into the file so it is the value the plugin
+            # actually uses, then remove it again so cases stay independent.
+            cfg = self.home / ".jcode/plugins/self-improve/env"
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            existing = cfg.read_text() if cfg.exists() else ""
+            cfg.write_text(
+                existing + f"SELF_IMPROVE_MEMORY_URL={mem_url}\n"
+            )
+            self.addCleanup(self._restore_env_file, cfg, existing)
         return run_plugin(env, home=self.home)
+
+    def _restore_env_file(self, cfg, existing: str) -> None:
+        if existing:
+            cfg.write_text(existing)
+        elif cfg.exists():
+            cfg.unlink()
 
     def test_full_turn_records_a_skill_lesson(self):
         res = self.run_turn()
@@ -409,13 +431,11 @@ class FakeGatewayTest(unittest.TestCase):
         )
 
     def test_memory_share_posts_to_bank_route(self):
-        """The lesson share must hit /banks/{bank}/retain (not /retain).
+        """The project fact must hit /banks/{bank}/retain (not /retain).
 
-        The fake gateway records the request path on a sibling file, so the
-        test asserts the exact route rather than trusting a substring.
+        The fake gateway records the request path on a sibling file, so the test
+        asserts the exact route rather than trusting a substring.
         """
-        import socket
-
         paths_file = self.home / "paths.log"
         path_server = self.home / "pathserver.py"
         path_server.write_text(PATH_SERVER_PY)
@@ -441,16 +461,94 @@ class FakeGatewayTest(unittest.TestCase):
             proc.wait(timeout=3)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(
-            len([e for e in self.ledger_entries() if e.get("kind") == "skill"]), 1
+            len([e for e in self.ledger_entries() if e.get("kind") == "genome"]), 1
         )
         self.assertTrue(paths_file.exists(), "no retain request was recorded")
-        self.assertIn("POST /banks/memory-wire/retain", paths_file.read_text())
+        logged = [json.loads(l) for l in paths_file.read_text().splitlines() if l.strip()]
+        self.assertIn("/banks/memory-wire/retain", [r["path"] for r in logged])
+
+    def test_skill_lesson_never_reaches_memory(self):
+        """Memory is for project facts, so a skill lesson must not be shared.
+
+        A skill lesson transfers across projects by definition. Writing it to the
+        shared bank puts one project's procedure into every project's active
+        context, which is subagent telemetry, not project memory.
+        """
+        paths_file = self.home / "paths.log"
+        path_server = self.home / "pathserver.py"
+        path_server.write_text(PATH_SERVER_PY)
+        mem_port = free_port()
+        proc = subprocess.Popen(
+            [sys.executable, str(path_server), str(mem_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(100):
+                try:
+                    s = socket.create_connection(("127.0.0.1", mem_port), timeout=0.1)
+                    s.close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                self.fail("path server did not start")
+            # The fake gateway scores every turn 0.9/0.9, so both branches always
+            # fire. Ask for the skill-only scoring so this case can actually
+            # isolate the skill branch, while the curator still records a lesson.
+            self.restart_gateway(skill_only=True)
+            res = self.run_turn(mem_url=f"http://127.0.0.1:{mem_port}")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(
+            len([e for e in self.ledger_entries() if e.get("kind") == "skill"]), 1
+        )
+        logged = [json.loads(l) for l in paths_file.read_text().splitlines() if l.strip()] if paths_file.exists() else []
+        self.assertNotIn(
+            "/banks/memory-wire/retain", [r["path"] for r in logged],
+            "a skill lesson must never be shared to memory",
+        )
+
+    def test_memory_share_carries_the_project_fact_not_the_lesson(self):
+        """The shared content is the project fact, tagged as one."""
+        paths_file = self.home / "paths.log"
+        path_server = self.home / "pathserver.py"
+        path_server.write_text(PATH_SERVER_PY)
+        mem_port = free_port()
+        proc = subprocess.Popen(
+            [sys.executable, str(path_server), str(mem_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(100):
+                try:
+                    s = socket.create_connection(("127.0.0.1", mem_port), timeout=0.1)
+                    s.close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                self.fail("path server did not start")
+            res = self.run_turn(mem_url=f"http://127.0.0.1:{mem_port}")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rows = [json.loads(l) for l in paths_file.read_text().splitlines() if l.strip()]
+        payload = json.loads(rows[-1]["body"])
+        self.assertEqual(payload["tags"], ["hook:sync-turn", "project-fact"])
+        # The content is the fact, not a '[skill]' lesson blob.
+        self.assertFalse(payload["content"].startswith("["))
+        self.assertTrue(payload["content"])
 
     def test_memory_share_to_dead_server_logs_and_does_not_fail(self):
         # A refused connection must be logged, not raised, and the lesson stays.
         res = self.run_turn(mem_url="http://127.0.0.1:1")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(len([e for e in self.ledger_entries() if e.get("kind") == "skill"]), 1)
+        self.assertEqual(len([e for e in self.ledger_entries() if e.get("kind") == "genome"]), 1)
         self.assertTrue(
             any(d.get("kind") == "memory-failed" for d in self.diags()),
             self.diags(),
@@ -574,7 +672,7 @@ class FakeGatewayTest(unittest.TestCase):
             else:
                 self.assertEqual(b["model"], "large-stack")
 
-    def restart_gateway(self) -> None:
+    def restart_gateway(self, skill_only: bool = False) -> None:
         """Stop and restart the fake gateway from its current script.
 
         The port must be fresh: reusing one after terminate lets the dying socket
@@ -587,7 +685,7 @@ class FakeGatewayTest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait(timeout=3)
-        self._spawn_gateway()
+        self._spawn_gateway(skill_only=skill_only)
         self._wait_for_port()
 
     # -- diagnostic arm coverage ------------------------------------------
@@ -714,11 +812,15 @@ GATEWAY_PY = r'''
 import json, http.server, socketserver, sys
 from pathlib import Path
 
+# Set SKILL_ONLY=1 to score genome 0.0 while the curator still answers with a real
+# lesson. A case that needs to isolate the skill branch needs both halves: a
+# router that fires only skill, and a curator that still records something.
+SKILL_ONLY = __import__("os").environ.get("SKILL_ONLY") == "1"
+ROUTER_ANSWER = json.dumps({"skill_worthy": 0.9, "genome_worthy": 0.0 if SKILL_ONLY else 0.9})
+
 HERE = Path(__file__).parent
 RECV = HERE / "received.jsonl"
 ANSWER = HERE / "answer.txt"
-
-ROUTER_ANSWER = json.dumps({"skill_worthy": 0.9, "genome_worthy": 0.9})
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -773,7 +875,7 @@ with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H) as httpd:
 
 
 PATH_SERVER_PY = r'''
-import http.server, socketserver, sys
+import http.server, socketserver, sys, json
 from pathlib import Path
 
 LOGPATH = Path(__file__).with_name("paths.log")
@@ -782,10 +884,12 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
-        if n:
-            self.rfile.read(n)
+        body = self.rfile.read(n).decode() if n else ""
         with LOGPATH.open("a") as f:
-            f.write(f"{self.command} {self.path}\n")
+            # One JSON object per line: {"path":..., "body":...}. Recording only
+            # the path could not prove what the plugin actually sent, which is the
+            # point of routing the share through a sink.
+            f.write(json.dumps({"path": self.path, "body": body}) + "\n")
         out = b'{"id":"stub"}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

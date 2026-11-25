@@ -613,11 +613,18 @@ print(json.dumps(entry))
   cue_short=$(printf '%s' "$cue" | head -c 80 | tr '\n' ' ')
   log_diag "curation-recorded" "branch=$kind" "cue=$cue_short"
 
-  # Share the lesson with memory-wire, verbatim from the plugin's own memory contract.
+  # Share the PROJECT fact with memory-wire. The genome branch only.
+  #
+  # The lesson and the genome fact are stored in the ledger, which is the product.
+  # Memory is a different system with a different job: what the project is actively
+  # working on. A '[skill] <lesson>' row in the shared bank is subagent telemetry,
+  # the agent drinking its own notes, and it dilutes the bank the other harnesses
+  # recall from. Only the genome branch writes memory.
   #
   # The route is /banks/{bank}/retain, not /retain — verified against the live server
-  # (memory-wire mcp / serve both serve MemoryService; memory-wire's own hermes integration
-  # posts the same shape at "{base}/banks/{bank}/retain"). A bare /retain 404s.
+  # (memory-wire mcp / serve both serve MemoryService; memory-wire's own hermes
+  # integration posts the same shape at "{base}/banks/{bank}/retain"). A bare /retain
+  # 404s.
   #
   # Default off: no URL means no call, no dependency, and the suite runs without one.
   # Set SELF_IMPROVE_MEMORY_URL to the BASE (e.g. http://127.0.0.1:8888) and the
@@ -629,6 +636,13 @@ print(json.dumps(entry))
   local mem_base="${SELF_IMPROVE_MEMORY_URL:-}"
   local mem_bank="${SELF_IMPROVE_MEMORY_BANK:-memory-wire}"
 
+  # A skill lesson is transferable across projects, so it is never a project fact.
+  # Writing it to memory would put one project's procedure into every project's
+  # active context.
+  if [[ "$kind" != "genome" ]]; then
+    return 0
+  fi
+
   # Do not fail on an unreachable server: a memory share that fails must never
   # take down the turn that produced it, and must never block on one either.
   if [[ -n "$mem_base" ]]; then
@@ -636,17 +650,28 @@ print(json.dumps(entry))
     payload=$(python3 -c "
 import json, sys
 print(json.dumps({
-    'content': f'[{sys.argv[1]}] {sys.argv[2]}',
-    'context': sys.argv[3],
-    'tags': ['hook:sync-turn'],
+    'content': sys.argv[1],
+    'context': sys.argv[2],
+    'tags': ['hook:sync-turn', 'project-fact'],
 }))
-" "$kind" "$lesson" "$evidence" 2>/dev/null) || payload=''
+" "$cue" "$turn_ref" 2>/dev/null) || payload=''
     if [[ -n "$payload" ]]; then
-      curl -sS --connect-timeout 1 --max-time 3 \
+      # Report the curl exit status, not just "unreachable". A share that fails
+      # for any other reason (bad URL, refused, timeout) was indistinguishable
+      # from a dead server, which hid a real misconfiguration during bring-up.
+      local curl_rc=0
+      # 1s was too tight: curl's --connect-timeout bounds the connect AND the
+      # first byte, and Python's http.server under test load can exceed it,
+      # surfacing as curl 52 (empty reply) rather than a refused connection.
+      # 3s connect / 5s total still fails fast on a genuinely dead server.
+      curl -sS --connect-timeout 3 --max-time 5 \
           -X POST "${mem_base}/banks/${mem_bank}/retain" \
           -H "Content-Type: application/json" \
           -d "$payload" \
-          >/dev/null 2>&1 || log_diag "memory-failed" "branch=$kind" "reason=unreachable"
+          >/dev/null 2>&1 || curl_rc=$?
+      if (( curl_rc != 0 )); then
+        log_diag "memory-failed" "branch=$kind" "reason=curl_${curl_rc}"
+      fi
     fi
   fi
 }
