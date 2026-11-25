@@ -21,11 +21,81 @@
 #     O(n^2) over every row: 28,226 candidates from 1,339 rows in 4.5s, and ~7
 #     minutes at 4,288. The call is timeboxed, and a timeout leaves the day-stamp
 #     unset so the next session retries instead of losing the day.
+#
+# Usage:
+#   dream.sh              run the stage (what session_end calls)
+#   dream.sh --report     read the ledger back: what each dream pass found
+#
+# --report exists because a recorded field with no reader is a promise, not a
+# contract. It is read-only: it never runs a pass and never writes.
 set -uo pipefail
 
 SELF_IMPROVE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SELF_IMPROVE_DIR/lib/common.sh"
+
+# Report mode: read the ledger back, grouped by bank, and say what is still
+# unapplied. Handled before anything else so it cannot claim the day or write.
+if [ "${1:-}" = "--report" ]; then
+  self_improve_load_env
+  LEDGER="$SELF_IMPROVE_LEDGER" python3 - <<'PY'
+import json, os, sys
+
+path = os.environ["LEDGER"]
+try:
+    fh = open(path, encoding="utf-8")
+except FileNotFoundError:
+    print("no ledger yet at %s" % path)
+    raise SystemExit(0)
+
+banks = {}
+total = applied = 0
+for line in fh:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue          # a truncated or foreign row is not a dream record
+    if e.get("kind") != "dream":
+        continue
+    total += 1
+    if e.get("applied"):
+        applied += 1
+    b = banks.setdefault(e.get("bank") or "?", {
+        "passes": 0, "candidates": 0, "by_kind": {}, "last": None,
+    })
+    b["passes"] += 1
+    b["last"] = e.get("ts")
+    detail = e.get("detail") or ""
+    try:
+        d = json.loads(detail)
+    except ValueError:
+        d = {}
+    b["candidates"] += d.get("total") or 0
+    for k, v in (d.get("by_kind") or {}).items():
+        b["by_kind"][k] = b["by_kind"].get(k, 0) + v
+
+if not total:
+    print("no dream records in %s" % path)
+    raise SystemExit(0)
+
+print("dream report  (%s)" % path)
+print("  passes: %d   applied: %d   awaiting a decision: %d"
+      % (total, applied, total - applied))
+for bank in sorted(banks):
+    b = banks[bank]
+    kinds = ", ".join("%s %d" % (k, b["by_kind"][k])
+                       for k in sorted(b["by_kind"])) or "none"
+    print("  %-40s passes=%-3d candidates=%-6d last=%s"
+          % (bank, b["passes"], b["candidates"], b["last"]))
+    print("      %s" % kinds)
+print("\nNothing was applied. Candidates are a report, not an action: a wrong")
+print("merge silently corrupts recall and there is no undo.")
+PY
+  exit 0
+fi
 
 log() { printf '%s\n' "$*" >>"${SELF_IMPROVE_LOG:-/tmp/self-improve.log}"; }
 
@@ -44,12 +114,18 @@ mkdir -p "$dream_dir" 2>/dev/null
 
 # One record writer for this stage, built on the shared ledger_append so the write
 # is atomic and both stages land in one file.
+#
+# The JSON is captured into a variable and piped, never written to a file first.
+# A fixed temp name (the earlier `$dream_dir/.rec`) is shared by every session, so
+# two sessions ending together clobbered each other and the loser appended a
+# two-line file that parses as ONE merged record. A variable cannot be clobbered by
+# another process, and the printf feeds ledger_append's lock directly.
 record() {
   # $1 = outcome, $2 = detail, $3 = optional extra JSON object fragment
   local outcome="$1" detail="${2:-}" extra="${3:-}"
-  local ts
+  local ts json
   ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
-  REC_TS="$ts" REC_HOOK="$hook_id" REC_BANK="$bank" REC_OUTCOME="$outcome" \
+  json=$(REC_TS="$ts" REC_HOOK="$hook_id" REC_BANK="$bank" REC_OUTCOME="$outcome" \
   REC_DETAIL="$detail" REC_EXTRA="$extra" python3 -c '
 import json, os
 entry = {
@@ -67,27 +143,75 @@ if extra:
     except ValueError:
         pass
 print(json.dumps(entry))
-' > "$dream_dir/.rec" 2>/dev/null || return 0
-  ledger_append "$(cat "$dream_dir/.rec")"
-  rm -f "$dream_dir/.rec"
+' 2>/dev/null) || return 0
+  [ -n "$json" ] || return 0
+  ledger_append "$json"
 }
 
 # Already dreamed for this bank today? The pass is too expensive to repeat.
+#
+# The stamp is the claim, and it is written BEFORE the work. A lock around the read
+# cannot fix the race on its own: two sessions each take the lock in turn, both see
+# no stamp, both release, and both run the pass. A real two-process probe measured 2
+# passes and 2 ledger rows where 1 was expected.
+#
+# The stamp is written first and KEPT. It is not keyed on a pid: the claiming
+# process exits moments later, so a pid-keyed stamp reads as stale immediately and
+# the next session reclaims the day (which is exactly the bug that produced two
+# 'clean' rows in a row). A day is either spent or it is not, and only a pass that
+# did not complete releases it.
+#
+# The lock covers the read and the write together, so two sessions starting at the
+# same instant cannot both see an empty stamp: the loser finds today's date and
+# skips. A lock held across the pass itself would serialise every session's exit for
+# nothing, so the lock is taken only for the check-and-claim.
 stamp="$dream_dir/${bank//\//_}.last"
 today=$(date -u +%Y-%m-%d)
-if [ -f "$stamp" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$today" ]; then
-  log "dream $hook_id: bank=$bank already consolidated today, skipping"
-  record "skipped" "already ran today"
-  log_diag "dream-skipped" "bank=$bank"
+mkdir -p "$dream_dir" 2>/dev/null
+claim_state="none"
+{
+  flock 8
+  if [ "$(cat "$stamp" 2>/dev/null)" = "$today" ]; then
+    claim_state="held"
+  else
+    printf '%s\n' "$today" >"$stamp" 2>/dev/null && claim_state="claimed"
+  fi
+} 8>"$dream_dir/${bank//\//_}.lock"
+
+if [ "$claim_state" != "claimed" ]; then
+  if [ "$claim_state" = "held" ]; then
+    log "dream $hook_id: bank=$bank already consolidated today, skipping"
+    record "skipped" "already ran today"
+    log_diag "dream-skipped" "bank=$bank"
+  else
+    # The claim could not be written. That is not "already done": the pass did not
+    # run, so the day is not spent and a later session should still get it.
+    log "dream $hook_id: bank=$bank could not claim the day, skipping"
+    record "error" "could not claim the day"
+    log_diag "dream-error" "reason=claim" "bank=$bank"
+  fi
   cap_file "$SELF_IMPROVE_LEDGER"
   exit 0
 fi
+
+# From here this session owns the day. Every exit path below either completes the
+# pass or drops the claim, so a failure never burns the day's only attempt.
+release_claim() {
+  {
+    flock 8
+    # Only drop it if it is still today's: a later session may have re-claimed.
+    if [ "$(cat "$stamp" 2>/dev/null)" = "$today" ]; then
+      rm -f "$stamp" 2>/dev/null
+    fi
+  } 8>"$dream_dir/${bank//\//_}.lock"
+}
 
 # No memory-wire configured or reachable is not an error: sharing is opt-in, and a
 # host without memory-wire must still close its session cleanly.
 if [ -z "$mem_url" ]; then
   log "dream $hook_id: no SELF_IMPROVE_MEMORY_URL, nothing to consolidate"
   record "disabled" "no memory url configured"
+  release_claim
   exit 0
 fi
 
@@ -104,12 +228,14 @@ if [ "$mem_code" != "200" ]; then
     log "dream $hook_id: memory-wire unreachable at $mem_url"
     record "error" "memory-wire unreachable"
     log_diag "dream-error" "reason=unreachable" "bank=$bank"
+    release_claim
     exit 0
   fi
   log "dream $hook_id: bank '$bank' answered $mem_code, nothing to consolidate"
   record "empty" "bank has no memories"
-  # No stamp: the first memory of the session may land after this hook, so a
-  # later session should still get its dream.
+  # The bank does not exist, so there is nothing to consolidate and the day is not
+  # spent: release it so a later session with rows still gets its dream.
+  release_claim
   exit 0
 fi
 
@@ -125,7 +251,9 @@ rows="${rows:--1}"
 if [ "$rows" -lt 2 ]; then
   log "dream $hook_id: bank=$bank has $rows row(s), nothing to consolidate"
   record "empty" "fewer than 2 memories"
-  date -u +%Y-%m-%d >"$stamp" 2>/dev/null
+  # Fewer than two rows can never produce a candidate, and a memory may still
+  # land later today, so the pass has nothing to mark. The claimed day stays: a
+  # second session today would reach the same empty bank and write the same row.
   exit 0
 fi
 
@@ -142,6 +270,9 @@ if [ "$rc" -ne 0 ]; then
   log "dream $hook_id: hygiene failed rc=$rc (curl timeout is 124)"
   record "error" "hygiene rc=$rc"
   log_diag "dream-error" "reason=hygiene" "rc=$rc" "bank=$bank"
+  # The pass did not complete, so the day is not spent and the next session should
+  # retry rather than be told it already consolidated.
+  release_claim
   cap_file "$SELF_IMPROVE_LEDGER"
   exit 0
 fi
@@ -149,7 +280,11 @@ fi
 # applied=false is the safety contract, and it is a real field rather than a
 # promise: a reader can tell a report from an action, and nothing in this stage
 # writes to memory. Applying candidates stays an explicit human act.
-python3 - "$out" "$rows" "$hook_id" "$bank" > "$dream_dir/.rec" 2>/dev/null <<'PY'
+#
+# The JSON goes into a variable, not a file. A fixed temp name is shared by every
+# session, so the earlier version let two sessions clobber each other and append a
+# merged two-line record that parses as one.
+json=$(python3 - "$out" "$rows" "$hook_id" "$bank" 2>/dev/null <<'PY'
 import datetime, json, sys
 path, rows, hid, bank = sys.argv[1:5]
 try:
@@ -177,12 +312,13 @@ entry = {
 }
 print(json.dumps(entry))
 PY
-if [ -s "$dream_dir/.rec" ]; then
-  ledger_append "$(cat "$dream_dir/.rec")"
+)
+if [ -n "$json" ]; then
+  ledger_append "$json"
   log_diag "dream-recorded" "bank=$bank" "rows=$rows"
 fi
-rm -f "$dream_dir/.rec"
 
-date -u +%Y-%m-%d >"$stamp" 2>/dev/null
+# The pass completed, so the claim this session wrote stays in place as today's
+# stamp. Nothing to rewrite: that is the point of writing the claim first.
 cap_file "$SELF_IMPROVE_LEDGER"
 exit 0

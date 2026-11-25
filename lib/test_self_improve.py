@@ -1028,6 +1028,7 @@ def run_dream(
     env: dict[str, str],
     *,
     home: Path,
+    args: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run dream.sh with a sandboxed HOME and a minimal env."""
     base_env = {
@@ -1037,7 +1038,7 @@ def run_dream(
     }
     base_env.update(env)
     return subprocess.run(
-        ["bash", str(DREAM)],
+        ["bash", str(DREAM), *(args or [])],
         env=base_env,
         capture_output=True,
         text=True,
@@ -1194,6 +1195,163 @@ class DreamTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         stamps = list(self.state_dir.glob("*.last"))
         self.assertEqual(stamps, [], stamps)
+
+    def test_two_sessions_ending_together_run_one_pass(self):
+        """The once-a-day guarantee holds when two sessions overlap.
+
+        The bug: the stamp was read, the pass ran, and only then was the stamp
+        written. Two sessions ending together both saw no stamp and both ran the
+        pass. A lock around the read alone does not fix it (both take the lock in
+        turn, both still see an empty stamp), so the claim is written FIRST, under
+        the lock, and the loser reads it and skips.
+
+        Two real processes are started together on purpose: an in-process stub
+        cannot expose a check-then-act race, because each call would still run to
+        completion in the same process.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        env = {
+            "HOME": str(self.home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "JCODE_HOOK_CWD": str(self.home),
+            "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
+            "SELF_IMPROVE_MEMORY_BANK": "b1",
+            "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+            "SELF_IMPROVE_LEDGER": str(self.ledger),
+            "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+        }
+        procs = []
+        try:
+            for i in range(2):
+                # Started together, not one after the other: a serial second run
+                # would trivially see the stamp and prove nothing.
+                procs.append(subprocess.Popen(
+                    ["bash", str(DREAM)],
+                    env=dict(env, JCODE_HOOK_ID=f"race{i}"),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ))
+            for p in procs:
+                _out, err = p.communicate(timeout=60)
+                self.assertEqual(p.returncode, 0, err)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+
+        rows = self._dreams()
+        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual(
+            sorted(r["outcome"] for r in rows),
+            ["clean", "skipped"],
+            rows,
+        )
+        # The real assertion: the expensive pass ran ONCE, not once per session.
+        # A merged line would parse as one row and hide the loss, so count both.
+        raw = self.ledger.read_text().splitlines()
+        self.assertEqual(len(raw), len(rows), raw)
+
+    def test_two_sessions_ending_together_do_not_lose_a_row(self):
+        """Neither session's record may be clobbered by the other.
+
+        The earlier writer built its JSON in a fixed `$dream_dir/.rec` and then
+        appended it. Two sessions shared that name, so one overwrote the other and
+        the loser appended a two-line file that parses as ONE record whose fields
+        are the union of both. The record is now built in a variable, which no other
+        process can clobber.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        env = {
+            "HOME": str(self.home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "JCODE_HOOK_CWD": str(self.home),
+            "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
+            "SELF_IMPROVE_MEMORY_BANK": "b1",
+            "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+            "SELF_IMPROVE_LEDGER": str(self.ledger),
+            "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl"),
+        }
+        procs = []
+        try:
+            for i in range(2):
+                procs.append(subprocess.Popen(
+                    ["bash", str(DREAM)],
+                    env=dict(env, JCODE_HOOK_ID=f"clob{i}"),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ))
+            for p in procs:
+                _out, err = p.communicate(timeout=60)
+                self.assertEqual(p.returncode, 0, err)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        rows = self._dreams()
+        # Every row parses on its own and carries exactly one outcome. A merged
+        # line would still parse, but its outcome would be one of the two and the
+        # row count would be short.
+        self.assertEqual(len(rows), 2, rows)
+        for r in rows:
+            self.assertIn(r["outcome"], {"clean", "skipped"}, r)
+        self.assertEqual(
+            len(self.ledger.read_text().splitlines()), len(rows),
+            "a merged line would make this count short",
+        )
+
+    def test_report_reads_the_ledger_and_applies_nothing(self):
+        """--report is the reader for the applied field.
+
+        A recorded field with no consumer is a promise, not a contract. The report
+        must be read-only: it runs no pass, writes no row and claims no day.
+        """
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {
+                    "bank": "b1", "rows_scanned": 2,
+                    "candidates": [
+                        {"kind": "merge", "detail": "merge: a, b"},
+                        {"kind": "supersede", "detail": "supersede: b"},
+                    ],
+                },
+            }
+        })
+        try:
+            self.assertEqual(self._run(port, "b1", "rep").returncode, 0)
+            before = self.ledger.read_text()
+            # The stamp the first pass claimed, captured so the report can be
+            # checked against it: the report must not touch it either way.
+            stamps_before = sorted(p.name for p in self.state_dir.glob("*.last"))
+            self.assertEqual(stamps_before, ["b1.last"], stamps_before)
+            res = run_dream(
+                {"JCODE_HOOK_ID": "report", "JCODE_HOOK_CWD": str(self.home),
+                 "SELF_IMPROVE_STATE_ROOT": str(self.home / ".jcode/self-improve"),
+                 "SELF_IMPROVE_LEDGER": str(self.ledger),
+                 "SELF_IMPROVE_DIAGNOSTICS": str(self.home / "diag.jsonl")},
+                home=self.home, args=["--report"],
+            )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # Read-only: the ledger is byte-identical and the stamp is untouched.
+        self.assertEqual(self.ledger.read_text(), before)
+        self.assertEqual(
+            sorted(p.name for p in self.state_dir.glob("*.last")), stamps_before,
+        )
+        out = res.stdout
+        self.assertIn("passes: 1", out)
+        self.assertIn("applied: 0", out)
+        self.assertIn("awaiting a decision: 1", out)
+        self.assertIn("merge 1", out)
+        self.assertIn("supersede 1", out)
 
     def test_env_file_supplies_the_memory_url(self):
         """dream.sh reads the SAME env file the turn loop reads.
