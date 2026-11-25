@@ -40,6 +40,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 PLUGIN = ROOT / "self-improve.sh"
+DREAM = ROOT / "dream.sh"
 
 
 def run_plugin(
@@ -938,6 +939,220 @@ socketserver.TCPServer.allow_reuse_address = True
 with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H) as httpd:
     httpd.serve_forever()
 '''
+
+
+MEMORY_SERVER_PY = r'''
+import http.server, socketserver, sys, json
+from pathlib import Path
+
+# A stand-in for memory-wire's real routes: GET /banks/<id>/memories and
+# GET /banks/<id>/hygiene. The paths are the ones the binary actually serves
+# (strings-< the binary > shows /banks/:id/memories and /banks/:id/hygiene);
+# an earlier draft of dream.sh guessed /banks and /hygiene/scan, and only a
+# live probe caught it. Pinned here so a wrong path fails a test, not a session.
+STATE = Path(sys.argv[2])
+BANKS = json.loads(STATE.read_text())
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, obj, code=200):
+        out = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def do_GET(self):
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        # banks/<id>/memories
+        if len(parts) == 3 and parts[0] == "banks" and parts[2] == "memories":
+            bank = parts[1]
+            if bank not in BANKS:
+                return self._send({"detail": "unknown bank"}, 404)
+            return self._send(BANKS[bank]["memories"])
+        # banks/<id>/hygiene
+        if len(parts) == 3 and parts[0] == "banks" and parts[2] == "hygiene":
+            bank = parts[1]
+            if bank not in BANKS:
+                return self._send({"detail": "unknown bank"}, 404)
+            return self._send(BANKS[bank]["hygiene"])
+        # Any other route is a 404, NOT a 200. A catch-all 200 is exactly
+        # how the first draft of dream.sh passed its own tests while the paths
+        # were wrong; the failure only appeared against the real binary.
+        return self._send({"detail": "Not Found"}, 404)
+
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", int(sys.argv[1])), H) as httpd:
+    httpd.serve_forever()
+'''
+
+
+def run_dream(
+    env: dict[str, str],
+    *,
+    home: Path,
+) -> subprocess.CompletedProcess:
+    """Run dream.sh with a sandboxed HOME and a minimal env."""
+    base_env = {
+        "HOME": str(home),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    base_env.update(env)
+    return subprocess.run(
+        ["bash", str(DREAM)],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+class DreamTest(unittest.TestCase):
+    """The dream stage: session_end consolidation over the project bank.
+
+    Four contracts, each with a case:
+      * a bank with rows gets a hygiene pass, and the candidates are RECORDED
+        with applied=0 (never auto-applied);
+      * the pass runs at most once per bank per day, because hygiene is O(n^2);
+      * an unreachable server and an unknown bank are both non-fatal, exit 0,
+        and are told apart in the ledger;
+      * a failure never writes the day-stamp, so the next session retries.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        # dream.sh defaults to $HOME/.jcode/hooks/self-improve/, which is the
+        # live ledger's real location. Pointing this at the home root instead
+        # made every case fail on an empty list rather than on behaviour.
+        self.ledger = self.home / ".jcode/hooks/self-improve/ledger.jsonl"
+        self.state_dir = self.home / ".jcode/hooks/self-improve/dream"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _serve(self, banks: dict) -> tuple[subprocess.Popen, int]:
+        state = self.home / "banks.json"
+        state.write_text(json.dumps(banks))
+        server = self.home / "memserver.py"
+        server.write_text(MEMORY_SERVER_PY)
+        port = free_port()
+        proc = subprocess.Popen(
+            [sys.executable, str(server), str(port), str(state)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(100):
+            try:
+                s = socket.create_connection(("127.0.0.1", port), timeout=0.1)
+                s.close()
+                return proc, port
+            except OSError:
+                time.sleep(0.05)
+        proc.terminate()
+        self.fail("memory server did not start")
+
+    def _run(self, port: int, bank: str, hook_id: str = "d1"):
+        return run_dream(
+            {
+                "JCODE_HOOK_ID": hook_id,
+                "JCODE_HOOK_CWD": str(self.home),
+                "SELF_IMPROVE_MEMORY_URL": f"http://127.0.0.1:{port}",
+                "SELF_IMPROVE_MEMORY_BANK": bank,
+                # A separate state dir per home keeps one test's day-stamp from
+                # leaking into the next test's opinion of whether the pass ran.
+                "SELF_IMPROVE_STATE_DIR": str(self.state_dir),
+            },
+            home=self.home,
+        )
+
+    def _dreams(self) -> list[dict]:
+        return [e for e in read_jsonl(self.ledger) if e.get("kind") == "dream"]
+
+    def test_candidates_are_recorded_and_never_applied(self):
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+                "hygiene": {
+                    "bank": "b1",
+                    "rows_scanned": 3,
+                    "candidates": [
+                        {"kind": "merge", "detail": "merge: a, b"},
+                        {"kind": "supersede", "detail": "supersede: c"},
+                        {"kind": "merge", "detail": "merge: b, c"},
+                    ],
+                },
+            }
+        })
+        try:
+            res = self._run(port, "b1")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        dreams = self._dreams()
+        self.assertEqual(len(dreams), 1, dreams)
+        d = dreams[0]
+        self.assertEqual(d["outcome"], "candidates")
+        self.assertEqual(d["bank"], "b1")
+        # applied=0 is the safety contract: a wrong merge corrupts recall with
+        # no undo, so consolidation stays an explicit human act.
+        self.assertEqual(d["applied"], 0)
+        detail = json.loads(d["detail"])
+        self.assertEqual(detail["total"], 3)
+        self.assertEqual(detail["by_kind"], {"merge": 2, "supersede": 1})
+        self.assertEqual(detail["rows_scanned"], 3)
+
+    def test_second_run_the_same_day_is_skipped(self):
+        proc, port = self._serve({
+            "b1": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "b1", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        try:
+            self.assertEqual(self._run(port, "b1", "first").returncode, 0)
+            self.assertEqual(self._run(port, "b1", "second").returncode, 0)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        dreams = self._dreams()
+        self.assertEqual([d["outcome"] for d in dreams], ["clean", "skipped"], dreams)
+
+    def test_unreachable_server_is_not_fatal(self):
+        # Port 1 is not listening; nothing else is needed to be unreachable.
+        res = self._run(1, "b1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        dreams = self._dreams()
+        self.assertEqual([d["outcome"] for d in dreams], ["error"], dreams)
+        self.assertIn("unreachable", dreams[0]["detail"])
+
+    def test_unknown_bank_is_empty_not_an_error(self):
+        proc, port = self._serve({
+            "other": {
+                "memories": [{"id": "a"}, {"id": "b"}],
+                "hygiene": {"bank": "other", "rows_scanned": 2, "candidates": []},
+            }
+        })
+        try:
+            res = self._run(port, "missing")
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        dreams = self._dreams()
+        self.assertEqual([d["outcome"] for d in dreams], ["empty"], dreams)
+        # No stamp: a later session may have rows to consolidate.
+        stamps = list(self.state_dir.glob("*.last"))
+        self.assertEqual(stamps, [], stamps)
+
+    def test_a_failed_pass_leaves_no_stamp(self):
+        """A timeout or error must not burn the day's only attempt."""
+        res = self._run(1, "b1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        stamps = list(self.state_dir.glob("*.last"))
+        self.assertEqual(stamps, [], stamps)
 
 
 PATH_SERVER_PY = r'''
