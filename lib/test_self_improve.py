@@ -465,7 +465,15 @@ class FakeGatewayTest(unittest.TestCase):
         )
         self.assertTrue(paths_file.exists(), "no retain request was recorded")
         logged = [json.loads(l) for l in paths_file.read_text().splitlines() if l.strip()]
-        self.assertIn("/banks/memory-wire/retain", [r["path"] for r in logged])
+        # The bank is DERIVED, not pinned. The fake HOME sits under the real repo
+        # tree, so the work-tree walk reaches this repository's own .git and the
+        # remote rung wins. Asserting the derived name is the point: a hardcoded
+        # bank would put every project in one namespace.
+        self.assertEqual(
+            [r["path"] for r in logged],
+            ["/banks/ishan-parihar-self-improve-plugin/retain"],
+            logged,
+        )
 
     def test_skill_lesson_never_reaches_memory(self):
         """Memory is for project facts, so a skill lesson must not be shared.
@@ -506,9 +514,67 @@ class FakeGatewayTest(unittest.TestCase):
             len([e for e in self.ledger_entries() if e.get("kind") == "skill"]), 1
         )
         logged = [json.loads(l) for l in paths_file.read_text().splitlines() if l.strip()] if paths_file.exists() else []
-        self.assertNotIn(
-            "/banks/memory-wire/retain", [r["path"] for r in logged],
+        self.assertEqual(
+            logged,
+            [],
             "a skill lesson must never be shared to memory",
+        )
+
+    def test_bank_is_derived_from_the_origin_remote(self):
+        """A git repo's bank comes from owner/repo, not a pinned constant.
+
+        This is the whole point of the change: one shared bank makes every
+        project's facts recallable in every other project's context. The fake HOME
+        gets a real .git/config with an origin, so the remote rung is exercised.
+        """
+        repo = self.home / "proj"
+        (repo / ".git").mkdir(parents=True)
+        (repo / ".git" / "config").write_text(
+            '[core]\n\trepositoryformatversion = 0\n\n'
+            '[remote "origin"]\n\turl = https://github.com/acme/widget.git\n'
+        )
+        paths_file = self.home / "paths.log"
+        path_server = self.home / "pathserver.py"
+        path_server.write_text(PATH_SERVER_PY)
+        mem_port = free_port()
+        proc = subprocess.Popen(
+            [sys.executable, str(path_server), str(mem_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(100):
+                try:
+                    s = socket.create_connection(("127.0.0.1", mem_port), timeout=0.1)
+                    s.close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                self.fail("path server did not start")
+            env = {
+                "JCODE_HOOK_STATUS": "ok",
+                "JCODE_HOOK_LAST_ASSISTANT_TEXT": "The operator ruled on a design question.",
+                "JCODE_HOOK_SESSION_ID": "s",
+                "JCODE_HOOK_CWD": str(repo),
+                "AROUTE_API_KEY": "dummy",
+                "SELF_IMPROVE_ROUTER_URL": f"http://127.0.0.1:{self.port}/v1/chat/completions",
+                "SELF_IMPROVE_SKILL_THRESHOLD": "0.5",
+                "SELF_IMPROVE_GENOME_THRESHOLD": "0.5",
+            }
+            cfg = self.home / ".jcode/plugins/self-improve/env"
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            cfg.write_text(f"SELF_IMPROVE_MEMORY_URL=http://127.0.0.1:{mem_port}\n")
+            res = run_plugin(env, home=self.home)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=3)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        logged = [json.loads(l) for l in paths_file.read_text().splitlines() if l.strip()]
+        self.assertEqual(
+            [r["path"] for r in logged],
+            ["/banks/acme-widget/retain"],
+            logged,
         )
 
     def test_memory_share_carries_the_project_fact_not_the_lesson(self):

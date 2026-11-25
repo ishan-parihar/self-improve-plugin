@@ -444,6 +444,99 @@ ${digest}"
   parse_and_record_curation "$response" "genome" "$turn_ref"
 }
 
+# Resolve the memory-wire bank for a directory, mirroring memory-wire's own
+# ladder (src/paths.rs): explicit setting, else `owner/repo` from the origin
+# remote, else the work-tree basename, else the built-in default.
+#
+# Mirrored rather than shelled out because `memory-wire` has no resolve command,
+# and `doctor --bank` would bake a name in, which is the thing being removed. The
+# filesystem walk is deliberate over `git rev-parse`: a spawned git collapses a
+# missing binary, a timeout and "not a repository" into one answer, and a hook
+# cannot tell a transient failure from the real thing.
+memory_wire_derive_bank() {
+  local dir="${1:-$PWD}"
+  MEM_DERIVE_DIR="$dir" python3 - <<'PY' 2>/dev/null || echo memory-wire
+import os, re, sys
+
+def sanitize(raw):
+    mapped = "".join(
+        c.lower() if (c.isascii() and (c.isalnum() or c in "-_.")) else "-"
+        for c in raw
+    )
+    trimmed = mapped.strip("-.")
+    return trimmed or None
+
+def worktree_root(d):
+    cur = os.path.abspath(d)
+    while True:
+        if os.path.exists(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+def origin_url(root):
+    cfg = os.path.join(root, ".git", "config")
+    # A worktree's .git is a file pointing elsewhere; read through it.
+    if os.path.isfile(cfg):
+        try:
+            target = open(cfg).read().strip()
+            if target.startswith("gitdir:"):
+                gd = target.split(":", 1)[1].strip()
+                cfg = os.path.join(root, gd, "config")
+        except OSError:
+            return None
+    try:
+        text = open(cfg, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    in_origin = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            in_origin = line.lower().startswith('[remote "origin"]')
+            continue
+        if not in_origin or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        if k.strip().lower() == "url" and v.strip():
+            return v.strip()
+    return None
+
+def owner_repo(url):
+    url = url.strip().rstrip("/")
+    if "://" in url:
+        rest = url.split("://", 1)[1]
+        if "/" not in rest:
+            return None
+        path = rest.split("/", 1)[1]
+    else:
+        if ":" not in url:
+            return None
+        path = url.rsplit(":", 1)[1]
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    segs = [s for s in path.split("/") if s]
+    if len(segs) < 2:
+        return None
+    return f"{segs[-2]}/{segs[-1]}"
+
+d = os.environ.get("MEM_DERIVE_DIR") or os.getcwd()
+root = worktree_root(d)
+bank = None
+if root:
+    url = origin_url(root)
+    if url:
+        orp = owner_repo(url)
+        if orp:
+            bank = sanitize(orp)
+if not bank:
+    bank = sanitize(os.path.basename(os.path.normpath(os.path.abspath(d))))
+print(bank or "memory-wire")
+PY
+}
+
 parse_and_record_curation() {
   local response="$1"
   local kind="$2"
@@ -634,7 +727,16 @@ print(json.dumps(entry))
   # aborts the whole hook. An unset share URL is the default (sharing is opt-in), so
   # reading it must be an empty string, not a fatal error.
   local mem_base="${SELF_IMPROVE_MEMORY_URL:-}"
-  local mem_bank="${SELF_IMPROVE_MEMORY_BANK:-memory-wire}"
+  # Bank resolution mirrors memory-wire's own ladder (src/paths.rs): an explicit
+  # setting wins, else `owner/repo` from the origin remote, else the work-tree
+  # basename, else the built-in default. Deriving it here rather than pinning one
+  # shared bank is what keeps each project's facts in its own namespace: a single
+  # bank makes every project's memory recallable in every other project's context,
+  # and it makes the hygiene scan O(n^2) over everyone's rows at once.
+  local mem_bank="${SELF_IMPROVE_MEMORY_BANK:-}"
+  if [[ -z "$mem_bank" ]]; then
+    mem_bank=$(memory_wire_derive_bank "${JCODE_HOOK_CWD:-$PWD}")
+  fi
 
   # A skill lesson is transferable across projects, so it is never a project fact.
   # Writing it to memory would put one project's procedure into every project's
